@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>圆周未央，万核同数 —— 在 GPU 上使用 PyTorch 计算 π 的小数点后 100 万位</title>
+<style>
+  :root{--ink:#1c2330;--muted:#5b6577;--line:#e2e6ee;--accent:#2f6df6;--good:#0f8a4d;--warn:#b45309;--box:#f6f8fc}
+  *{box-sizing:border-box}
+  body{margin:0;color:var(--ink);background:#fff;line-height:1.75;font-size:17px;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:900px;margin:0 auto;padding:44px 24px 120px}
+  h1{font-size:29px;line-height:1.3;margin:0 0 6px}
+  h2{font-size:23px;margin:54px 0 12px;padding-top:14px;border-top:2px solid var(--line)}
+  h3{font-size:18px;margin:26px 0 8px;color:#25304a}
+  p{margin:12px 0}
+  a{color:var(--accent);text-decoration:none}
+  code{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:.92em;background:#eef1f7;padding:1px 6px;border-radius:5px;color:#243}
+  pre{background:#0f1524;color:#e6ebf5;padding:15px 17px;border-radius:10px;overflow-x:auto;
+    font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:13.5px;line-height:1.62;white-space:pre}
+  pre .c{color:#7c88a1}
+  .lead{font-size:18px;color:var(--muted)}
+  .box{background:var(--box);border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin:18px 0}
+  .key{border-left:4px solid var(--accent);background:#eef4ff}
+  .good{border-left:4px solid var(--good);background:#eefaf2}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:680px){.grid2{grid-template-columns:1fr}}
+  table{border-collapse:collapse;width:100%;margin:16px 0;font-size:15px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left}
+  th{background:#f2f5fb}
+  .fig{margin:20px 0;text-align:center}.fig svg{max-width:100%;height:auto}
+  .cap{color:var(--muted);font-size:14px;margin-top:6px}
+  .tag{display:inline-block;background:#12a594;color:#fff;border-radius:20px;padding:2px 12px;font-size:13px;margin:2px 6px 2px 0}
+  .toc{columns:2;font-size:15px}.toc a{display:block;padding:3px 0;color:#2a3550}
+  @media(max-width:680px){.toc{columns:1}}
+  .fn{color:var(--muted);font-size:13.5px;margin:4px 0 2px}
+  sub,sup{font-size:.7em}
+  math{font-size:1.15em}
+  math[display="block"]{display:block;margin:18px auto;overflow-x:auto;max-width:100%}
+  .eq{background:var(--box);border:1px solid var(--line);border-radius:12px;padding:8px 14px;margin:18px 0}
+</style></head><body><div class="wrap">
+
+<h1>圆周未央，万核同数</h1>
+<p class="lead">在 GPU 上使用 PyTorch 计算 π 的小数点后 100 万位</p>
+
+<div class="box key"><b>一句话总结。</b> 只用 PyTorch，在一块 GPU 上从零实现「大整数运算」，
+再用收敛极快的 Chudnovsky 公式把 π 算到小数点后 <b>100 万位</b>，与公开权威数据逐位比对——<b>全部一致</b>。
+本文按「原理 → 对应代码 → 详解」的顺序展开。</div>
+
+<h2>目录</h2>
+<div class="toc">
+<a href="#c1">1. 挑战：为什么不能直接算</a>
+<a href="#c2">2. 并行的唯一心法：从循环到整片数组</a>
+<a href="#c3">3. 用 limb 数组表示大整数（代码）</a>
+<a href="#c4">4. 加法与进位（代码）</a>
+<a href="#c5">5. Chudnovsky 公式：每项顶 14 位（代码）</a>
+<a href="#c6">6. 二分裂：把求和变成少数几次乘法（代码）</a>
+<a href="#c7">7. FFT 大整数乘法（代码）</a>
+<a href="#c8">8. 牛顿迭代：除法与开方（代码）</a>
+<a href="#c9">9. 组装出 π（代码）</a>
+<a href="#c10">10. 与公开 ground truth 比对（代码 + 结果）</a>
+</div>
+
+<h2 id="c1">1. 挑战：为什么不能直接算</h2>
+<p><b>浮点数装不下。</b> C++ 的 <code>double</code>、Python 的 <code>float</code> 都是 64 位浮点数，只有约 15～16 位有效数字。
+要 100 万位，差了 5 个数量级——这不是精度不够，而是类型里根本没那么多位置。</p>
+<p><b>PyTorch 里没有「大整数」。</b> Python 内置 <code>int</code> 虽是任意精度，但它在 CPU 上单线程运行；
+而 GPU 张量只有 <code>int64</code>、<code>float64</code> 这类<b>定长</b>类型。所以我们要<b>自己用一大片小数字（数组）拼出一个大数</b>，
+把大数的加减乘除翻译成<b>对整片数组的运算</b>，交给 GPU 上成千上万个核心并行完成。</p>
+
+<h2 id="c2">2. 并行的唯一心法：从「循环」到「整片数组」</h2>
+<div class="grid2">
+<div class="box"><b>CPU＝几位博士生</b><br>核心少但强，擅长「一步依赖上一步」的复杂逻辑；跑 <code>for</code> 循环是一次一格。</div>
+<div class="box"><b>GPU＝上万名小学生</b><br>GPU 上数万个 CUDA 核心，每个只会简单算术，但能<b>同时开工</b>。</div>
+</div>
+<p>要用上 GPU，就得把「逐元素的循环」改写成「对整片数组的一次运算」：</p>
+<div class="fig"><svg viewBox="0 0 720 190" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="13">
+<text x="10" y="18" font-size="14" fill="#5b6577">串行 CPU：n 步</text><text x="430" y="18" font-size="14" fill="#5b6577">并行 GPU：一次</text>
+<rect x="10" y="34" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/><rect x="10" y="66" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/><rect x="10" y="98" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/><rect x="10" y="130" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/>
+<text x="78" y="52">a[0]=b[0]+c[0]</text><text x="78" y="84">a[1]=b[1]+c[1]</text><text x="78" y="116">a[2]=b[2]+c[2]</text><text x="78" y="148">…（第 n 步）</text>
+<path d="M39 60 L39 66 M39 92 L39 98 M39 124 L39 130" stroke="#b45309" stroke-width="2"/>
+<g transform="translate(430,0)"><rect x="0" y="34" width="44" height="122" fill="#eefaf2" stroke="#8fd3ad"/>
+<text x="7" y="52" fill="#0f8a4d">a[0]</text><text x="7" y="80" fill="#0f8a4d">a[1]</text><text x="7" y="108" fill="#0f8a4d">a[2]</text><text x="7" y="140" fill="#0f8a4d">a[n]</text>
+<text x="56" y="98">= b + c</text></g></svg>
+<div class="cap">左：<code>for i: a[i]=b[i]+c[i]</code>，n 步顺序。右：<code>a = b + c</code>，一次并行完成。</div></div>
+<div class="box key"><b>全文最重要的一句话：</b>后面每一个大数运算，我们都会把它写成「对整片 limb 数组的运算」，这样它才真正跑在 GPU 上。</div>
+
+<h2 id="c3">3. 用 limb 数组表示大整数</h2>
+<p><b>原理。</b> 把大整数拆成许多 0～999 的小数字，每个叫一个 <b>limb</b>，整体是一个 <code>int64</code> 数组（低位在前）。
+选基 1000（＝10³）是因为最终要输出十进制：每个 limb 恰好 3 位数字，<b>输出零成本</b>。100 万位 π ≈ 33.4 万个 limb。</p>
+<div class="fig"><svg viewBox="0 0 660 92" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="14">
+<text x="10" y="16" font-size="12" fill="#5b6577">数值 12,345,678 = 678 + 345·1000 + 12·1000²</text>
+<g transform="translate(0,28)"><rect x="20" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0"/><text x="52" y="25">12</text>
+<rect x="120" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0"/><text x="145" y="25">345</text>
+<rect x="220" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0"/><text x="245" y="25">678</text>
+<text x="20" y="55" font-size="11" fill="#5b6577">limb[2]（高位）</text><text x="230" y="55" font-size="11" fill="#5b6577">limb[0]（低位）</text></g></svg>
+<div class="cap">大整数 = limb 数组（小端，下标 0 是最低位）。</div></div>
+<p><b>代码。</b> 构造与输出——注意输出时只是把每个 limb 补足 3 位再拼接，天然是十进制：</p>
+<pre>def from_int(n):
+    """Python 整数 -&gt; limb 张量（要求 n &gt;= 0，通常 n 较小，如常数/种子）。"""
+    n = int(n)
+    assert n &gt;= 0
+    if n == 0:
+        return zero()
+    limbs = []
+    while n &gt; 0:
+        limbs.append(n % B)
+        n //= B
+    return torch.tensor(limbs, dtype=DT, device=DEV)</pre>
+<pre>def to_decimal_str(x):
+    """limb 张量 -&gt; 十进制字符串（无前导零）。每个 limb 补足 3 位再拼接。"""
+    limbs = x.tolist()
+    s = "".join("%03d" % int(d) for d in reversed(limbs))
+    s = s.lstrip("0")
+    return s if s else "0"</pre>
+<p><b>详解。</b> <code>from_int</code> 反复取 <code>n % 1000</code> 当作最低 limb、再 <code>n //= 1000</code>，得到小端数组；
+它只用于常数和种子这类小数字。<code>to_decimal_str</code> 把数组从高位到低位、每个 limb 用 <code>%03d</code> 补零拼接，
+再去掉最前面的多余 0——100 万位 π 的输出就是这么直接得来的。</p>
+<h2 id="c4">4. 加法与进位</h2>
+<p><b>原理。</b> 小学的「逐位相加、逢千进一」是天生串行的（第 k 位进位要等第 k−1 位）。GPU 上改成两步：
+先<b>整片相加</b>（某些 limb 会暂时超过 999，不管它），再<b>整片传播进位</b>——把每个 limb 的溢出
+<code>c // 1000</code> 整体挪高一格加上去、自己留 <code>c % 1000</code>，重复几趟直到没有溢出。每趟都是整片数组运算。</p>
+<p><b>代码。</b> 进位归一化，以及基于它的加法：</p>
+<pre>def normalize(c):
+    """把（可能含很大项的）系数张量归一到每个 limb 都在 [0, B) 的规范形式。
+    向量化的进位传播：每一趟把溢出部分整体上移一位相加，直到没有进位。"""
+    c = F.pad(c, (0, 8))  <span class="c"># 预留高位空间容纳进位</span>
+    while True:
+        carry = c // B
+        if int(torch.count_nonzero(carry).item()) == 0:
+            break
+        c = c % B
+        c = c + F.pad(carry[:-1], (1, 0))  <span class="c"># carry[i] 加到 limb i+1</span>
+    return strip(c)</pre>
+<pre>def add(x, y):
+    n = max(x.shape[0], y.shape[0])
+    x = F.pad(x, (0, n - x.shape[0]))
+    y = F.pad(y, (0, n - y.shape[0]))
+    return normalize(x + y)</pre>
+<p><b>详解。</b> <code>normalize</code> 里 <code>carry = c // 1000</code> 一次算出所有 limb 的溢出；
+<code>c[1:] = c[1:] + carry[:-1]</code> 把溢出<b>整体</b>挪高一位相加（这一行就是「进位」的并行版）。
+一次乘法产生的系数可能高达几千亿，但 1000 的幂每趟把溢出缩小 1000 倍，通常 <b>4～6 趟</b>就全部归位；
+<code>count_nonzero(carry)</code> 用来判断「还有没有进位」。<code>add</code> 只需把两数补齐等长、相加，再交给 <code>normalize</code>。</p>
+<p>减法用对称的「借位」思路（下面附了 <code>sub</code> 的实现），比较大小 <code>cmp</code> 则从最高位找第一个不同的 limb。</p><pre>def sub(x, y):
+    """返回 x - y，要求 x &gt;= y &gt;= 0。向量化借位传播。"""
+    n = max(x.shape[0], y.shape[0])
+    x = F.pad(x, (0, n - x.shape[0]))
+    y = F.pad(y, (0, n - y.shape[0]))
+    d = x - y
+    while True:
+        neg = d &lt; 0
+        if int(torch.count_nonzero(neg).item()) == 0:
+            break
+        negi = neg.to(DT)
+        d = d + negi * B                       <span class="c"># 负 limb 加 B 变正</span>
+        d = d - F.pad(negi[:-1], (1, 0))       <span class="c"># 向高一位借 1</span>
+    return strip(d)</pre>
+
+<h2 id="c5">5. Chudnovsky 公式：每一项顶 14 位</h2>
+<p><b>原理。</b> 莱布尼茨级数极慢（100 万项才 6～7 位）：</p>
+<div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mi>&#960;</mi><mn>4</mn></mfrac><mo>=</mo><mn>1</mn><mo>&#8722;</mo><mfrac><mn>1</mn><mn>3</mn></mfrac><mo>+</mo><mfrac><mn>1</mn><mn>5</mn></mfrac><mo>&#8722;</mo><mfrac><mn>1</mn><mn>7</mn></mfrac><mo>+</mo><mo>&#8943;</mo></math></div>
+<p>我们改用 1988 年的 Chudnovsky 公式：</p>
+<div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>&#960;</mi><mo>=</mo><mfrac><mrow><mn>426880</mn><mo>&#8901;</mo><msqrt><mn>10005</mn></msqrt></mrow><mstyle displaystyle="true"><munderover><mo>&#8721;</mo><mrow><mi>k</mi><mo>=</mo><mn>0</mn></mrow><mi>&#8734;</mi></munderover><mfrac><mrow><mo>(</mo><mn>6</mn><mi>k</mi><mo>)</mo><mo>!</mo><mo>(</mo><mn>13591409</mn><mo>+</mo><mn>545140134</mn><mi>k</mi><mo>)</mo></mrow><mrow><mo>(</mo><mn>3</mn><mi>k</mi><mo>)</mo><mo>!</mo><msup><mrow><mo>(</mo><mi>k</mi><mo>!</mo><mo>)</mo></mrow><mn>3</mn></msup><msup><mrow><mo>(</mo><mo>&#8722;</mo><mn>640320</mn><mo>)</mo></mrow><mrow><mn>3</mn><mi>k</mi></mrow></msup></mrow></mfrac></mstyle></mfrac></math></div>
+<p>关键事实：<b>每多算一项，多确定约 14.18 位十进制</b>（相邻项相差约 640320³ ≈ 2.6×10<sup>17</sup> 倍）。
+所以 100 万位只需约 <b>70,500 项</b>；我们取 <b>N = 71,432</b> 并留 32 位保护位。</p>
+<p><b>代码。</b> 每一项（「叶子」）就是几个整数相乘。为避免 7 万次逐个上传，我们先在 GPU 上<b>批量</b>算好所有项的整型中间量
+（<code>Pval, a3, factor</code> 都是长度 N 的张量），再按需取用：</p>
+<pre>    def leaf(a):
+        if a == 0:
+            return from_int(1), from_int(1), (1, from_int(A_CONST))
+        P = i64_to_limbs(Pval[a], 6)          <span class="c"># (6a-5)(2a-1)(6a-1) &lt;= 2.6e16 -&gt; &lt;=6 limbs</span>
+        Q = mul(i64_to_limbs(a3[a], 5), CONST)
+        T = mul_scalar_t(P, factor[a])
+        Ts = -1 if (a &amp; 1) else 1
+        return P, Q, (Ts, T)</pre>
+<p><b>详解。</b> 对第 a 项：<code>P=(6a−5)(2a−1)(6a−1)</code>；<code>Q=a³·10939058860032000</code>（即 640320³/24）；
+<code>T=P·(13591409+545140134a)</code>，奇数项取负号。其中 <code>Q</code> 高达约 4×10³⁰，超过 int64——所以走大整数乘法
+<code>mul(...)</code> 得到多 limb 结果；<code>a=0</code> 是特例（P=Q=1, T=13591409）。这些张量索引 <code>Pval[a]</code> 都发生在 GPU 上。</p>
+<h2 id="c6">6. 二分裂：把「求和」变成少数几次乘法</h2>
+<p><b>原理。</b> 7 万个分数直接通分相加，分母会爆炸、要做 O(N²) 次大数加法。<b>二分裂</b>像归并排序一样<b>分而治之</b>：
+一段连续项的和写成一个分数 <code>T/Q</code>（外加辅助量 <code>P</code>），相邻两段合并只需几次乘法。全程<b>精确整数</b>，无舍入。</p>
+<div class="fig"><svg viewBox="0 0 660 150" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="12">
+<g fill="#eef4ff" stroke="#9db8f0"><rect x="280" y="8" width="110" height="26"/><rect x="160" y="60" width="110" height="26"/><rect x="400" y="60" width="110" height="26"/>
+<rect x="120" y="112" width="70" height="26"/><rect x="240" y="112" width="70" height="26"/><rect x="380" y="112" width="70" height="26"/><rect x="490" y="112" width="70" height="26"/></g>
+<g fill="#25304a" text-anchor="middle"><text x="335" y="26">[0,N)</text><text x="215" y="78">[0,N/2)</text><text x="455" y="78">[N/2,N)</text>
+<text x="155" y="130">…</text><text x="275" y="130">…</text><text x="415" y="130">…</text><text x="525" y="130">叶子=项</text></g>
+<g stroke="#8aa0c8" fill="none"><path d="M335 34 L215 60"/><path d="M335 34 L455 60"/><path d="M215 86 L155 112"/><path d="M215 86 L275 112"/><path d="M455 86 L415 112"/><path d="M455 86 L525 112"/></g></svg>
+<div class="cap">递归对半拆、自底向上合并。</div></div>
+<p>相邻两段（中点 m）的合并规则是：</p>
+<div class="eq"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mtable columnspacing="0.3em" rowspacing="0.4em"><mtr><mtd columnalign="right"><mi>P</mi><mo>(</mo><mi>a</mi><mo>,</mo><mi>b</mi><mo>)</mo></mtd><mtd><mo>=</mo></mtd><mtd columnalign="left"><mi>P</mi><mo>(</mo><mi>a</mi><mo>,</mo><mi>m</mi><mo>)</mo><mo>&#8901;</mo><mi>P</mi><mo>(</mo><mi>m</mi><mo>,</mo><mi>b</mi><mo>)</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>Q</mi><mo>(</mo><mi>a</mi><mo>,</mo><mi>b</mi><mo>)</mo></mtd><mtd><mo>=</mo></mtd><mtd columnalign="left"><mi>Q</mi><mo>(</mo><mi>a</mi><mo>,</mo><mi>m</mi><mo>)</mo><mo>&#8901;</mo><mi>Q</mi><mo>(</mo><mi>m</mi><mo>,</mo><mi>b</mi><mo>)</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>T</mi><mo>(</mo><mi>a</mi><mo>,</mo><mi>b</mi><mo>)</mo></mtd><mtd><mo>=</mo></mtd><mtd columnalign="left"><mi>Q</mi><mo>(</mo><mi>m</mi><mo>,</mo><mi>b</mi><mo>)</mo><mo>&#8901;</mo><mi>T</mi><mo>(</mo><mi>a</mi><mo>,</mo><mi>m</mi><mo>)</mo><mo>+</mo><mi>P</mi><mo>(</mo><mi>a</mi><mo>,</mo><mi>m</mi><mo>)</mo><mo>&#8901;</mo><mi>T</mi><mo>(</mo><mi>m</mi><mo>,</mo><mi>b</mi><mo>)</mo></mtd></mtr></mtable></math></div>
+<p><b>代码。</b> 递归与合并规则；<code>T</code> 可能为负，用「幅值 + 符号」表示，合并时做有符号加法 <code>_sadd</code>：</p>
+<pre>    def bs(a, b):
+        if b - a == 1:
+            return leaf(a)
+        m = (a + b) // 2
+        Pam, Qam, Tam = bs(a, m)
+        Pmb, Qmb, Tmb = bs(m, b)
+        P = mul(Pam, Pmb)
+        Q = mul(Qam, Qmb)
+        s1, m1 = Tam
+        s2, m2 = Tmb
+        t1 = mul(Qmb, m1)          <span class="c"># 符号 s1</span>
+        t2 = mul(Pam, m2)          <span class="c"># 符号 s2</span>
+        Tmag, Ts = _sadd(s1, t1, s2, t2)
+        return P, Q, (Ts, Tmag)</pre>
+<pre>def _sadd(s1, m1, s2, m2):
+    """有符号加：(s1*m1) + (s2*m2) -&gt; (magnitude, sign)。"""
+    if s1 == s2:
+        return add(m1, m2), s1
+    c = cmp(m1, m2)
+    if c == 0:
+        return zero(), 1
+    if c &gt; 0:
+        return sub(m1, m2), s1
+    return sub(m2, m1), s2</pre>
+<p><b>详解。</b> 合并公式 <code>P=Pₐₘ·Pₘᵦ, Q=Qₐₘ·Qₘᵦ, T=Qₘᵦ·Tₐₘ+Pₐₘ·Tₘᵦ</code> 每次只需 4 次乘法，
+而且总是「两个规模相近的数」相乘——这对下一节的 FFT 乘法最友好。递归到底就是上一节的叶子。
+最终得到两个精确大整数 <code>Q(0,N)</code> 与 <code>T(0,N)</code>（各约 200 万位）。</p>
+<h2 id="c7">7. FFT 大整数乘法（最需要 GPU 的一步）</h2>
+<p><b>原理。</b> 把大数看成「1000 进制多项式」，两数相乘＝系数做<b>卷积</b>。朴素卷积 O(n²)，对 33 万 limb 要 10<sup>11</sup> 次乘法，太慢。
+<b>卷积定理</b>说：在「频域」里卷积＝逐点相乘。于是走一条近路——FFT 变到频域、逐点乘、逆 FFT 变回来，总代价降到 O(n log n)。</p>
+<div class="fig"><svg viewBox="0 0 680 150" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="12.5">
+<rect x="20" y="26" width="140" height="36" fill="#fdecec" stroke="#e6a6a6"/><text x="90" y="49" text-anchor="middle">两个系数数组</text>
+<rect x="20" y="104" width="140" height="34" fill="#eefaf2" stroke="#8fd3ad"/><text x="90" y="126" text-anchor="middle">乘积系数</text>
+<text x="90" y="86" text-anchor="middle" fill="#b45309" font-size="11">直接卷积 O(n²) ✗</text>
+<rect x="270" y="10" width="150" height="32" fill="#eef4ff" stroke="#9db8f0"/><text x="345" y="31" text-anchor="middle">频域（各自）</text>
+<rect x="270" y="120" width="150" height="30" fill="#eef4ff" stroke="#9db8f0"/><text x="345" y="140" text-anchor="middle">频域乘积</text>
+<path d="M162 38 C 230 18,250 18,270 26" fill="none" stroke="#2f6df6" stroke-width="2"/><text x="205" y="14" fill="#2f6df6">① FFT</text>
+<path d="M345 42 L345 120" stroke="#2f6df6" stroke-width="2"/><text x="352" y="86" fill="#2f6df6">② 逐点乘 O(n)</text>
+<path d="M270 135 C 220 140,200 135,162 125" fill="none" stroke="#2f6df6" stroke-width="2"/><text x="195" y="150" fill="#2f6df6">③ 逆 FFT</text>
+<text x="470" y="80" fill="#0f8a4d" font-size="13">总 O(n log n) ✓</text></svg>
+<div class="cap">FFT 乘法：把难做的卷积变成好做的逐点相乘。</div></div>
+<p><b>代码。</b> 小数字用直接的「外积求和」小乘法（避免 FFT 启动开销），大数字才用 <code>torch.fft</code>：</p>
+<pre>def mul_school(x, y):
+    """小规模乘法：外积后按反对角线累加（在 GPU 上）。"""
+    nx, ny = x.shape[0], y.shape[0]
+    outer = (x.view(-1, 1) * y.view(1, -1)).reshape(-1)
+    ii = torch.arange(nx, device=DEV).view(-1, 1).expand(nx, ny)
+    jj = torch.arange(ny, device=DEV).view(1, -1).expand(nx, ny)
+    idx = (ii + jj).reshape(-1)
+    coeffs = torch.zeros(nx + ny - 1, dtype=DT, device=DEV)
+    coeffs.index_add_(0, idx, outer)
+    return normalize(coeffs)</pre>
+<pre>def mul_fft(x, y):
+    """大规模乘法：float64 FFT 做线性卷积，四舍五入回整数，再归一化。"""
+    nx, ny = x.shape[0], y.shape[0]
+    m = nx + ny - 1
+    s = _npow2(m)
+    xf = torch.fft.rfft(x.to(torch.float64), n=s)
+    yf = torch.fft.rfft(y.to(torch.float64), n=s)
+    z = torch.fft.irfft(xf * yf, n=s)[:m]
+    zr = torch.round(z)
+    err = float((z - zr).abs().max().item())
+    assert err &lt; FFT_ASSERT, "FFT rounding error too large: %g (limbs %d x %d)" % (err, nx, ny)
+    return normalize(zr.to(DT))</pre>
+<pre>def mul(x, y):
+    nx, ny = x.shape[0], y.shape[0]
+    if nx == 0 or ny == 0:
+        return zero()
+    if max(nx, ny) &lt;= SCHOOL_THRESH:
+        return mul_school(x, y)
+    return mul_fft(x, y)</pre>
+<p><b>详解。</b> <code>rfft/irfft</code> 就是上图的 ① 和 ③，中间 <code>xf*yf</code> 是逐点相乘②；PyTorch 的这几个函数直接跑在 GPU 上。
+FFT 内部用浮点，为何还能得到<b>精确</b>整数？因为 float64 能精确表示到 2<sup>53</sup>≈9×10<sup>15</sup>，
+而我们的系数最大约 n·999² ≈ 7×10<sup>11</sup>，还差约<b>一万倍</b>余量，四舍五入 <code>round()</code> 就能无误差还原。
+更关键的是那行<b>安全阀</b> <code>assert err &lt; 0.25</code>：每次乘法都检查浮点结果离最近整数有多远，一旦越界立即报错，
+绝不<b>悄悄</b>算错。整个 100 万位计算里它从未触发。</p>
+<h2 id="c8">8. 牛顿迭代：只靠乘法做出除法与开方</h2>
+<p><b>原理。</b> 组装 π 需要一次开方和一次大整数除法，但我们只想用已经造好的<b>乘法</b>。牛顿迭代做到了：
+求倒数 1/T 用如下迭代，它<b>二次收敛</b>——每迭代一次正确位数翻倍：</p>
+<div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>x</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msub><mi>x</mi><mi>n</mi></msub><mo>&#8290;</mo><mo>(</mo><mn>2</mn><mo>&#8722;</mo><mi>T</mi><mo>&#8901;</mo><msub><mi>x</mi><mi>n</mi></msub><mo>)</mo></math></div>
+<p>从一个 <code>double</code> 种子（约 15 位）起步，约 17 步就到 100 万位。开方同理（先求 1/√K 再乘回 K）：</p>
+<div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>y</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><mfrac><mrow><msub><mi>y</mi><mi>n</mi></msub><mo>&#8290;</mo><mo>(</mo><mn>3</mn><mo>&#8722;</mo><mi>K</mi><mo>&#8901;</mo><msubsup><mi>y</mi><mi>n</mi><mn>2</mn></msubsup><mo>)</mo></mrow><mn>2</mn></mfrac></math></div>
+<div class="fig"><svg viewBox="0 0 680 56" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="13">
+<text x="10" y="26" fill="#25304a">15 → 30 → 60 → 120 → 240 → … → 1,000,000 位</text>
+<text x="10" y="46" fill="#0f8a4d" font-size="12">约 17 次迭代，每次只是一次（FFT）大整数乘法</text></svg></div>
+<p>其中要「除以 2」。因为基 1000 是<b>偶数</b>，除以 2 有个完全并行的写法——每个 limb 一次算完，无需串行借位：</p>
+<pre>def half(x):
+    d = x
+    lower = d // 2
+    parity_next = F.pad((d % 2)[1:], (0, 1))   <span class="c"># d_{i+1} 的奇偶性挪到位置 i</span>
+    res = lower + (B // 2) * parity_next
+    return strip(res)</pre>
+<p><b>详解（取半）。</b> 第 i 个 limb 的结果为：</p><div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>r</mi><mi>i</mi></msub><mo>=</mo><mo>&#8970;</mo><msub><mi>d</mi><mi>i</mi></msub><mo>/</mo><mn>2</mn><mo>&#8971;</mo><mo>+</mo><mn>500</mn><mo>&#8901;</mo><mo>(</mo><msub><mi>d</mi><mrow><mi>i</mi><mo>+</mo><mn>1</mn></mrow></msub><mspace width="0.25em"/><mi>mod</mi><mspace width="0.25em"/><mn>2</mn><mo>)</mo></math></div>
+<p>因为 1000 是偶数，向下传的借位恰好就是「高一位 limb 的奇偶性」<code>d<sub>i+1</sub> mod 2</code>，
+所以所有 limb 能一次并行算出，结果都 &lt; 1000，无需再传播。</p>
+<p><b>代码（除法）。</b> 牛顿倒数 <code>_recip</code> 求 <code>⌊1000<sup>g</sup>/T⌋</code>，<code>divide</code> 用它算 <code>⌊A/T⌋</code> 并做精确 ±1 校正：</p>
+<pre>def _recip(T, g):
+    Ts = strip(T)
+    dt = Ts.shape[0]
+    assert g &gt;= dt
+    <span class="c"># 用最高 2 个 limb 估计种子：T ≈ top * B**(dt-2)</span>
+    if dt &gt;= 2:
+        top = int(Ts[-1].item()) * B + int(Ts[-2].item())
+        e_top = dt - 2
+    else:
+        top = int(Ts[-1].item())
+        e_top = dt - 1
+    <span class="c"># w0 ≈ B**g / T = B**(g-e_top) / top ；用 q=B**4//top 放到合适位置</span>
+    q = (B ** 4) // top
+    shift = g - e_top - 4
+    if shift &gt;= 0:
+        w = shl_limbs(from_int(q), shift)
+    else:
+        w = from_int(q // (B ** (-shift)))
+    Bg = one_at(g)
+    one = from_int(1)
+    target_digits = max(1, (g - dt + 1) * LOGB)
+    niters = int(math.ceil(math.log2(target_digits / 4.0 + 2))) + 4
+    for _ in range(niters):
+        Tw = mul(T, w)
+        c = cmp(Bg, Tw)
+        if c == 0:
+            break
+        if c &gt; 0:
+            e = sub(Bg, Tw); es = 1
+        else:
+            e = sub(Tw, Bg); es = -1
+        delta = shr_limbs(mul(w, e), g)
+        if int(torch.count_nonzero(delta).item()) == 0:
+            break
+        w = add(w, delta) if es &gt; 0 else sub(w, delta)
+    <span class="c"># 精确 ±修正：保证 T*w &lt;= B**g &lt; T*(w+1)</span>
+    guard = 0
+    while cmp(mul(T, w), Bg) &gt; 0:
+        w = sub(w, one); guard += 1
+        assert guard &lt; 8
+    guard = 0
+    while cmp(mul(T, add(w, one)), Bg) &lt;= 0:
+        w = add(w, one); guard += 1
+        assert guard &lt; 8
+    return w</pre>
+<pre>def divide(A, T):
+    """返回 floor(A / T)，A、T 为非负 limb 张量，T&gt;0。"""
+    A = strip(A); T = strip(T)
+    if cmp(A, T) &lt; 0:
+        return zero()
+    g = A.shape[0] + 2
+    w = _recip(T, g)
+    q = shr_limbs(mul(A, w), g)
+    one = from_int(1)
+    <span class="c"># ±修正：保证 q*T &lt;= A &lt; (q+1)*T</span>
+    guard = 0
+    while cmp(mul(q, T), A) &gt; 0:
+        q = sub(q, one); guard += 1
+        assert guard &lt; 8
+    guard = 0
+    while cmp(mul(add(q, one), T), A) &lt;= 0:
+        q = add(q, one); guard += 1
+        assert guard &lt; 8
+    return strip(q)</pre>
+<p><b>详解（除法）。</b> <code>_recip</code> 先用 T 的最高两位 limb 估一个种子（约 5～6 位准），然后迭代
+<code>w ← w + w·(1000<sup>g</sup> − T·w)/1000<sup>g</sup></code>（其中「除以 1000<sup>g</sup>」就是把低 g 个 limb 整段丢掉，是精确的移位）；
+迭代次数按目标位数取（约 log₂），末尾用几步 <code>±1</code> 把「取整方向」校正到绝对正确。
+<code>divide</code> 拿到倒数后乘一下、再移位，同样做 ±1 校正，保证 <code>q·T ≤ A &lt; (q+1)·T</code>。</p>
+<p><b>代码（开方）。</b> 倒数平方根牛顿 <code>y ← y·(3 − K·y²)/2</code>，最后 <code>s = ⌊K·y⌋ ≈ √K</code>，再 ±1 校正：</p>
+<pre>def isqrt_big(K):
+    K = strip(K)
+    dk = K.shape[0]
+    if dk == 1:
+        return from_int(math.isqrt(int(K[0].item())))
+    h = dk + 2
+    <span class="c"># 种子：取最高 kt 个 limb（保证 e_low = dk-kt 为偶，便于开方对齐）</span>
+    kt = 6 if (dk - 6) % 2 == 0 else 5
+    kt = min(kt, dk)
+    if (dk - kt) % 2 != 0:
+        kt -= 1
+    e_low = dk - kt
+    Kh = 0
+    for i in range(kt):
+        Kh = Kh * B + int(K[dk - 1 - i].item())   <span class="c"># 最高 kt 个 limb 的值</span>
+    <span class="c"># K ≈ Kh * B**e_low, sqrt(K) ≈ sqrt(Kh) * B**(e_low/2)</span>
+    r = 1.0 / math.sqrt(float(Kh))                 <span class="c"># ≈ 1/sqrt(Kh) ∈ (0,1)</span>
+    mant = int(round(r * (B ** 6)))                <span class="c"># r ≈ mant * B**-6</span>
+    <span class="c"># y0 = B**h / sqrt(K) ≈ mant * B**-6 * B**(h - e_low/2)</span>
+    shift = h - (e_low // 2) - 6
+    if shift &gt;= 0:
+        y = shl_limbs(from_int(mant), shift)
+    else:
+        y = from_int(mant // (B ** (-shift)))
+    B2h = one_at(2 * h)
+    target_digits = max(1, h * LOGB)
+    niters = int(math.ceil(math.log2(target_digits / 4.0 + 2))) + 5
+    for _ in range(niters):
+        Ky2 = mul(K, mul(y, y))
+        c = cmp(B2h, Ky2)
+        if c == 0:
+            break
+        if c &gt; 0:
+            rr = sub(B2h, Ky2); rs = 1
+        else:
+            rr = sub(Ky2, B2h); rs = -1
+        delta = half(shr_limbs(mul(y, rr), 2 * h))
+        if int(torch.count_nonzero(delta).item()) == 0:
+            break
+        y = add(y, delta) if rs &gt; 0 else sub(y, delta)
+    s = shr_limbs(mul(K, y), h)
+    one = from_int(1)
+    guard = 0
+    while cmp(mul(add(s, one), add(s, one)), K) &lt;= 0:
+        s = add(s, one); guard += 1
+        assert guard &lt; 16
+    guard = 0
+    while cmp(mul(s, s), K) &gt; 0:
+        s = sub(s, one); guard += 1
+        assert guard &lt; 16
+    return strip(s)</pre>
+<p><b>详解（开方）。</b> 内层循环全是乘法（跑在 GPU 上的 FFT 乘法）加上那个并行的「除以 2」<code>half</code>；
+末尾 <code>while (s+1)² ≤ K</code> / <code>while s² &gt; K</code> 各校正至多几步，确保 <code>s</code> 恰为 <code>⌊√K⌋</code>。</p>
+<h2 id="c9">9. 组装出 π</h2>
+<p><b>原理。</b> 二分裂给出精确整数 Q、T 后，把 π 放大 10<sup>p</sup> 倍取整：</p>
+<div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>&#960;</mi><mo>&#8901;</mo><msup><mn>10</mn><mi>p</mi></msup><mo>=</mo><mrow><mo>&#8970;</mo><mfrac><mrow><mn>426880</mn><mo>&#8901;</mo><mi>Q</mi><mo>(</mo><mi>0</mi><mo>,</mo><mi>N</mi><mo>)</mo><mo>&#8901;</mo><msqrt><mrow><mn>10005</mn><mo>&#8901;</mo><msup><mn>10</mn><mrow><mn>2</mn><mi>p</mi></mrow></msup></mrow></msqrt></mrow><mrow><mi>T</mi><mo>(</mo><mi>0</mi><mo>,</mo><mi>N</mi><mo>)</mo></mrow></mfrac><mo>&#8971;</mo></mrow></math></div>
+<p>因为基是 1000＝10³，<code>10<sup>2p</sup></code> 恰好是整数个 limb（这也是取 p 为 3 的倍数的原因），开方与移位都精确。</p>
+<p><b>代码。</b> 组装的关键几行：</p>
+<pre>    <span class="c"># --- sqrt(10005) 放大到 10^p：isqrt(10005 * 10^{2p}) = isqrt(10005 * B^{2p/3}) ---</span>
+    K = shl_limbs(from_int(C_RAD), (2 * p) // LOGB)
+    sqrtC = isqrt_big(K)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t_sqrt = time.time()
+    if verbose:
+        print("  [isqrt(10005*1e2p)]      %.2fs" % (t_sqrt - t_bs))
+
+    <span class="c"># --- π*10^p = floor(426880 * Q * sqrtC / T) ---</span>
+    num = mul_scalar(Q, C_LIN)
+    num = mul(num, sqrtC)
+    pi_scaled = divide(num, T)</pre>
+<p><b>详解。</b> <code>shl_limbs(from_int(10005), 2p/3)</code> 造出 <code>10005·10<sup>2p</sup></code>（在低位补零＝乘 1000 的幂）；
+<code>isqrt_big</code> 得到 <code>√10005·10<sup>p</sup></code>；再乘上 <code>426880·Q</code>、除以 <code>T</code>，就是 π·10<sup>p</sup>。
+最后 <code>to_decimal_str</code> 把它转成十进制字符串，取「3.」加上后 100 万位即为结果。</p>
+<h2 id="c10">10. 与公开数据逐位比对</h2>
+<p><b>原理。</b> 从公开来源下载 π 的百万位权威数据，先校验这份数据<b>本身</b>可信（前 50 位、以及第 762–767 位著名的「费曼点」六个 9），
+再把我们 GPU 算出的<b>全部 100 万位</b>逐字符比对。</p>
+
+<p><b>结果。</b> 一百万位<b>全部一致</b>：</p>
+<pre>
+输出         : 1,000,000 位（内部按 p=1,000,032 计算，含 32 位保护位）
+项数 N       : 71,432        |Q|≈697,593 limbs   |T|≈697,595 limbs
+
+前 60 位     : 3.14159265358979323846264338327950288419716939937510 58209749 44…
+费曼点(762)  : …134999999837…            最后 10 位: 5779458151
+比对          : PASS —— 全部 1,000,000 位与公开数据一致</pre>
+<div class="box good">另外还做了两重内部保障：① 每次 FFT 乘法的 <code>&lt; 0.25</code> 断言从未触发；
+② 分别用 32 位与 65 位保护位各算一遍，前 100 万位完全相同。</div>
+
+</div></body></html>

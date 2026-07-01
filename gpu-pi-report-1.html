@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="从定点整数、Newton 迭代和 Gauss–Legendre 原理解释 π 小数点后 100 万位如何产生">
+  <title>在圆与无穷之间｜在 GPU 上使用 PyTorch 计算 π 的小数点后 100 万位</title>
+  <style>
+    :root { --ink:#172033; --muted:#596477; --paper:#fbfcff; --panel:#f1f5fb;
+      --line:#d7dfec; --blue:#2457d6; --green:#147d4f; --orange:#a64b00;
+      --code:#101828; --code-ink:#e7edf8; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:auto; }
+    body { margin:0; color:var(--ink); background:var(--paper); font-family:system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif; line-height:1.76; }
+    header,main,footer { width:min(1080px,calc(100% - 40px)); margin-inline:auto; }
+    header { padding:62px 0 34px; border-bottom:1px solid var(--line); }
+    h1 { max-width:930px; margin:0 0 18px; font-size:clamp(2rem,5vw,4.1rem); line-height:1.1; letter-spacing:-.04em; }
+    .subtitle { max-width:930px; margin:0 0 18px; color:var(--blue); font-size:clamp(1.18rem,2.4vw,1.8rem); font-weight:650; line-height:1.35; }
+    h2 { margin:70px 0 17px; padding-top:15px; border-top:1px solid var(--line); font-size:clamp(1.55rem,3vw,2.2rem); line-height:1.25; }
+    h3 { margin:32px 0 9px; font-size:1.2rem; }
+    p,li { max-width:82ch; }
+    a { color:var(--blue); text-underline-offset:3px; }
+    .lede { max-width:76ch; color:var(--muted); font-size:1.16rem; }
+    .badges { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 22px; }
+    .badge { padding:5px 11px; border:1px solid var(--line); border-radius:999px; background:#fff; font-size:.88rem; }
+    .pass { color:var(--green); border-color:#8cc7aa; background:#effbf4; font-weight:700; }
+    .summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:28px; }
+    .metric { min-height:108px; padding:16px; border:1px solid var(--line); border-radius:14px; background:#fff; }
+    .metric span { color:var(--muted); font-size:.85rem; }
+    .metric strong { display:block; margin-top:7px; font-size:1.32rem; overflow-wrap:anywhere; }
+    nav { margin:34px 0; padding:21px 25px; border-left:4px solid var(--blue); background:var(--panel); }
+    nav ol { columns:2; margin:8px 0 0; padding-left:24px; }
+    nav li { break-inside:avoid; margin:5px 0; }
+    .answer,.note,.proof { max-width:86ch; margin:22px 0; padding:17px 19px; border:1px solid #c6dcfa; border-radius:11px; background:#eef6ff; }
+    .answer { border-left:5px solid var(--blue); font-size:1.08rem; }
+    .proof { border-color:#b9dfc9; background:#effaf4; }
+    .warning { border-color:#f0c993; background:#fff6e8; }
+    figure { max-width:980px; margin:28px 0; overflow:hidden; border:1px solid var(--line); border-radius:16px; background:#fff; }
+    figure svg { display:block; width:100%; height:auto; background:#f8faff; }
+    figcaption { padding:14px 18px 17px; color:var(--muted); border-top:1px solid var(--line); }
+    svg text { font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; fill:#172033; }
+    .formula { display:flex; align-items:center; gap:20px; max-width:940px; margin:18px 0; padding:15px 18px; overflow:auto; border:1px solid var(--line); border-radius:10px; background:#fff; }
+    math { font-size:1.18rem; white-space:nowrap; }
+    code { font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace; }
+    pre { max-width:980px; padding:18px; overflow:auto; color:var(--code-ink); background:var(--code); border-radius:12px; line-height:1.55; tab-size:2; }
+    table { width:100%; max-width:980px; margin:18px 0; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+    th,td { padding:10px 12px; border:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { background:var(--panel); }
+    .digits,.limbline { max-width:980px; padding:15px 16px; border:1px solid var(--line); border-radius:10px; background:#fff; font-family:monospace; word-break:break-all; }
+    .hash { overflow-wrap:anywhere; word-break:break-all; }
+    pre.excerpt { margin-bottom:0; border-radius:12px 12px 0 0; font-size:.86rem; }
+    .code-title { max-width:980px; margin-top:24px; padding:10px 16px; color:#dbe7ff; background:#24324a; border-radius:10px 10px 0 0; font-size:.9rem; font-weight:700; }
+    .code-title + pre.excerpt { margin-top:0; border-radius:0; }
+    .code-notes { max-width:980px; margin:0 0 26px; padding:14px 18px 14px 42px; border:1px solid var(--line); border-top:0; border-radius:0 0 12px 12px; background:#f5f8fd; }
+    .code-notes li { margin:7px 0; padding-left:4px; }
+    .steps { counter-reset:step; padding:0; list-style:none; }
+    .steps li { position:relative; margin:15px 0; padding:15px 18px 15px 58px; border:1px solid var(--line); border-radius:11px; background:#fff; }
+    .steps li::before { counter-increment:step; content:counter(step); position:absolute; left:17px; top:14px; display:grid; place-items:center; width:28px; height:28px; border-radius:50%; color:#fff; background:var(--blue); font-weight:700; }
+    footer { margin-top:80px; padding:28px 0 50px; border-top:1px solid var(--line); color:var(--muted); }
+    @media (max-width:760px) { header,main,footer { width:min(100% - 24px,1080px); } .summary { grid-template-columns:1fr 1fr; } nav ol { columns:1; } table { display:block; overflow-x:auto; } .formula { display:block; } .formula span { display:block; margin-top:10px; } pre.excerpt { white-space:pre-wrap; overflow-wrap:anywhere; font-size:.72rem; } }
+    @media print { :root { --paper:#fff; --panel:#fff; } body { font-size:10.5pt; } header,main,footer { width:100%; } header { padding-top:0; } nav { display:none; } h2 { break-before:page; margin-top:0; } figure,table,.formula,.note,.proof,.answer { break-inside:avoid; } a { color:inherit; text-decoration:none; } a[href]::after { content:" (" attr(href) ")"; font-size:.8em; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>在圆与无穷之间</h1>
+  <p class="subtitle">在 GPU 上使用 PyTorch 计算 π 的小数点后 100 万位</p>
+</header>
+<main>
+  <nav aria-label="目录"><ol>
+    <li><a href="#overview">先看完整答案</a></li>
+    <li><a href="#fixed">把小数变成大整数</a></li>
+    <li><a href="#multiply">百万位整数怎样相乘</a></li>
+    <li><a href="#newton">怎样求倒数和平方根</a></li>
+    <li><a href="#gauss">为什么 Gauss 迭代会得到 π</a></li>
+    <li><a href="#walkthrough">从常量到一百万位的完整过程</a></li>
+    <li><a href="#proof">怎样确认这一百万位正确</a></li>
+  </ol></nav>
+
+  <section id="overview"><h2>1. 先给完整答案：一百万位从哪里来</h2>
+    <div class="answer"><strong>一句话答案：</strong>程序先计算一个近似于 <code>π × 10^1000256</code> 的超长整数；这个整数的十进制写法就是 <code>3</code> 后面接 <code>1000256</code> 位。取其中前 <code>1000000</code> 个小数位，丢弃最后 <code>256</code> 个保护位，就得到结果文件。</div>
+    <p>产生数字的是下面这条算术链：</p>
+    <figure>
+      <svg viewBox="0 0 1000 360" role="img" aria-labelledby="p1title p1desc"><title id="p1title">π 百万位的计算链</title><desc id="p1desc">从定点常量开始，经平方根、Gauss 迭代、倒数和定点乘法得到 π 的整数数组，再展开为十进制数字。</desc>
+        <defs><marker id="pa" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#2457d6"/></marker></defs>
+        <g text-anchor="middle"><rect x="25" y="120" width="125" height="90" rx="12" fill="#fff" stroke="#2457d6"/><text x="87" y="152" font-size="17">定点常量</text><text x="87" y="178" font-size="14">1, 1/2, 1/4</text><text x="87" y="198" font-size="14">放大 10^D</text>
+        <rect x="180" y="120" width="125" height="90" rx="12" fill="#fff" stroke="#2457d6"/><text x="242" y="152" font-size="17">Newton</text><text x="242" y="178" font-size="14">求 1/√2</text><text x="242" y="198" font-size="14">只用乘加</text>
+        <rect x="335" y="120" width="145" height="90" rx="12" fill="#eaf1ff" stroke="#2457d6"/><text x="407" y="152" font-size="17">22 轮 Gauss</text><text x="407" y="178" font-size="14">a,b,t,p 更新</text><text x="407" y="198" font-size="14">正确位数翻倍</text>
+        <rect x="510" y="120" width="135" height="90" rx="12" fill="#fff" stroke="#2457d6"/><text x="577" y="152" font-size="17">Newton</text><text x="577" y="178" font-size="14">求 1/(4t)</text><text x="577" y="198" font-size="14">代替长除法</text>
+        <rect x="675" y="120" width="135" height="90" rx="12" fill="#edf9f4" stroke="#147d4f"/><text x="742" y="152" font-size="17">π 的定点整数</text><text x="742" y="178" font-size="14">(a+b)²/(4t)</text><text x="742" y="198" font-size="14">500,128 对数字</text>
+        <rect x="840" y="120" width="135" height="90" rx="12" fill="#edf9f4" stroke="#147d4f"/><text x="907" y="152" font-size="17">十进制展开</text><text x="907" y="178" font-size="14">14,15,92,…</text><text x="907" y="198" font-size="14">取前 100 万位</text></g>
+        <g fill="none" stroke="#2457d6" stroke-width="3" marker-end="url(#pa)"><path d="M150 165 H172"/><path d="M305 165 H327"/><path d="M480 165 H502"/><path d="M645 165 H667"/><path d="M810 165 H832"/></g>
+        <text x="500" y="72" text-anchor="middle" font-size="22" font-weight="700">所有蓝色箭头传递的都是同样长度的 base-100 整数数组</text>
+        <text x="500" y="282" text-anchor="middle" font-size="17" fill="#596477">大数乘法由 FFT 完成；每次乘法后除以固定缩放因子，数值仍保持同一小数位数</text>
+      </svg>
+      <figcaption>这张图就是整个计算。后文只回答四个问题：数字怎样存、长乘法怎样做、平方根怎样做、Gauss 公式为什么趋向 π。</figcaption>
+    </figure>
+  </section>
+
+  <section id="fixed"><h2>2. 第一步：把小数问题变成大整数问题</h2>
+    <p>令内部精度 <code>D=1000256</code>，定义固定缩放因子：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>S</mi><mo>=</mo><msup><mn>10</mn><mi>D</mi></msup><mo>=</mo><msup><mn>100</mn><mn>500128</mn></msup></mrow></math><span>纯文本：S=10^D=100^500128。它不是实际生成的一串 1 后跟零，而是数组中约定的小数点位置。</span></div>
+    <p>任何非负实数 <code>x</code> 都用整数 <code>X</code> 表示：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>X</mi><mo>=</mo><mo>⌊</mo><mi>x</mi><mi>S</mi><mo>⌋</mo><mo>,</mo><mspace width="1em"/><mi>x</mi><mo>≈</mo><mfrac><mi>X</mi><mi>S</mi></mfrac></mrow></math><span>纯文本：把 x 乘以 10^D 后取整数。数组始终保存 X，程序心里记着它代表 X/S。</span></div>
+    <p>于是加减就是整数加减；两个定点数相乘时，要把多出来的一份缩放除掉：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>Z</mi><mo>=</mo><mo>⌊</mo><mfrac><mrow><mi>X</mi><mi>Y</mi></mrow><mi>S</mi></mfrac><mo>⌋</mo><mo>≈</mo><mo>(</mo><mi>x</mi><mi>y</mi><mo>)</mo><mi>S</mi></mrow></math><span>纯文本：X≈xS、Y≈yS，所以 XY≈xyS²；除以 S 后重新得到代表 xy 的同尺度整数。</span></div>
+
+    <h3>先用 8 位小数做一个完整缩小版</h3>
+    <p>假设只保留 8 位，<code>S=10⁸=100⁴</code>。那么：</p>
+    <div class="limbline">floor(π × 10⁸) = 314159265</div>
+    <p>把它按 100 进制连续取余，得到小端数组 <code>[65, 92, 15, 14, 3]</code>。反过来从整数位向小数位读，就是：</p>
+    <div class="digits">3 . 14 15 92 65　→　3.14159265</div>
+    <figure>
+      <svg viewBox="0 0 1000 330" role="img" aria-labelledby="p2title p2desc"><title id="p2title">定点数组如何变成十进制数字</title><desc id="p2desc">八位小数的 π 被存成整数 limb 3 和四个小数 limb 14、15、92、65；若最后两位是保护位，则输出前三个小数 limb。</desc>
+        <text x="55" y="50" font-size="21" font-weight="700">显示时从左向右读</text><path d="M290 43 H915" stroke="#2457d6" stroke-width="3"/><path d="M915 43 l-14 -8 v16 z" fill="#2457d6"/>
+        <g text-anchor="middle"><rect x="70" y="92" width="145" height="92" rx="12" fill="#eaf1ff" stroke="#2457d6"/><text x="142" y="130" font-size="27">3</text><text x="142" y="162" font-size="14">整数 limb</text>
+        <rect x="235" y="92" width="145" height="92" rx="12" fill="#edf9f4" stroke="#147d4f"/><text x="307" y="130" font-size="27">14</text><text x="307" y="162" font-size="14">第 1–2 位</text>
+        <rect x="400" y="92" width="145" height="92" rx="12" fill="#edf9f4" stroke="#147d4f"/><text x="472" y="130" font-size="27">15</text><text x="472" y="162" font-size="14">第 3–4 位</text>
+        <rect x="565" y="92" width="145" height="92" rx="12" fill="#edf9f4" stroke="#147d4f"/><text x="637" y="130" font-size="27">92</text><text x="637" y="162" font-size="14">第 5–6 位</text>
+        <rect x="730" y="92" width="180" height="92" rx="12" fill="#fff3df" stroke="#d58a35"/><text x="820" y="130" font-size="27">65</text><text x="820" y="162" font-size="14">示例中的保护位</text></g>
+        <text x="500" y="238" text-anchor="middle" font-size="18">若目标是 6 位、保护 2 位，输出 14 15 92，丢弃 65</text>
+        <text x="500" y="280" text-anchor="middle" font-size="16" fill="#596477">正式计算同理：输出前 500000 个小数 limb，丢弃末尾 128 个保护 limb</text>
+      </svg>
+      <figcaption>所以“产生一百万位”最终并没有神秘步骤：Gauss 迭代得到定点整数后，每个 limb 直接拆成十位和个位，依次写出即可。</figcaption>
+    </figure>
+    <p>正式数组有 500128 个小数 limb，每个保存两位：前 500000 个形成一百万个目标位，后 128 个形成 256 个保护位。另有两个整数 limb，用来容纳迭代中的 2、3 等常量。</p>
+
+    <h3>对应源码：小数点位置和常量编码</h3>
+    <div class="code-title">pi_gpu.py</div>
+    <pre class="excerpt"><code>    def __init__(self, digits, guard_digits, device="cuda:0"):
+        if digits &lt;= 0 or guard_digits &lt; 0:
+            raise ValueError("digits must be positive and guard_digits non-negative")
+        self.digits = int(digits)
+        self.guard_digits = int(guard_digits)
+        # 每个 limb 保存两位；向上取整得到所需小数 limb 数
+        self.fractional_limbs = (digits + guard_digits + 1) // 2
+        self.integer_limbs = INTEGER_LIMBS
+        # 完整数组 = 小数 limb + 两个整数 limb
+        self.limb_count = self.fractional_limbs + self.integer_limbs
+        # 后续所有多精度数组都绑定到同一计算设备
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError("the numerical core requires a CUDA device")
+        self._indices = {}
+        # 在设备上累计所有 FFT 乘法的最大舍入误差
+        self.max_fft_residual = torch.zeros((), dtype=torch.float64, device=self.device)
+        self.operations = Counter()
+        self.max_fft_length = 0
+</code></pre>
+    <ol class="code-notes">
+      <li><code>(digits + guard_digits + 1) // 2</code> 正是“两个十进制位一个 limb”。正式参数代入后得到 500128。</li>
+      <li><code>limb_count</code> 再加两个整数 limb；它们和小数 limb 组成一条定长数组，小数点只是约定在第 <code>fractional_limbs</code> 格之后。</li>
+      <li><code>device.type != "cuda"</code> 的检查不参与数学，但保证后续这些数组运算不会悄悄退回普通 Python 数字。</li>
+    </ol>
+    <div class="code-title">pi_gpu.py</div>
+    <pre class="excerpt"><code>    def literal(self, text):
+        """Encode a short non-negative decimal literal (initialization only)."""
+        text = str(text).strip()
+        if text.startswith("-"):
+            raise ValueError("this implementation stores unsigned values")
+        if "." in text:
+            integer, fraction = text.split(".", 1)
+        else:
+            integer, fraction = text, ""
+        if not integer:
+            integer = "0"
+        if not integer.isdigit() or (fraction and not fraction.isdigit()):
+            raise ValueError("invalid decimal literal: %r" % text)
+        if len(fraction) &gt; 2 * self.fractional_limbs:
+            discarded = fraction[2 * self.fractional_limbs :]
+            if any(ch != "0" for ch in discarded):
+                raise ValueError("literal does not fit fixed-point precision")
+            fraction = fraction[: 2 * self.fractional_limbs]
+
+        host_limbs = [0] * self.limb_count
+        # 在右侧补零，相当于把 0.25 写成 0.250000…
+        fraction = fraction.ljust(2 * self.fractional_limbs, "0")
+        # 从小数点向右，每两个十进制字符组成一个 base-100 limb
+        for pair_index in range(self.fractional_limbs):
+            pair = fraction[2 * pair_index : 2 * pair_index + 2]
+            # 靠近小数点的高位放到更高下标，形成小端布局
+            host_limbs[self.fractional_limbs - 1 - pair_index] = int(pair)
+        integer_value = int(integer)
+        # 整数部分同样按 base 100 连续取余
+        for offset in range(self.integer_limbs):
+            host_limbs[self.fractional_limbs + offset] = integer_value % BASE
+            integer_value //= BASE
+        if integer_value:
+            raise OverflowError("integer literal exceeds the two integer limbs")
+        # 编码完毕后一次性转成 CUDA int64 limb 数组
+        return torch.tensor(host_limbs, dtype=torch.int64, device=self.device)
+</code></pre>
+    <ol class="code-notes">
+      <li><code>fraction.ljust(..., "0")</code> 在字面量右侧补零，相当于把 <code>0.25</code> 写成 <code>0.250000…</code>，并没有改变数值。</li>
+      <li>循环每次读取两个字符；<code>fractional_limbs - 1 - pair_index</code> 把最靠近小数点的 <code>25</code> 放到高小数 limb，把更低位放到更低下标，因此形成小端布局。</li>
+      <li>整数部分从 <code>self.fractional_limbs</code> 开始按 100 连续取余；这就是前面示例里把 <code>314159265</code> 拆成 <code>[65,92,15,14,3]</code> 的同一动作。</li>
+      <li>最后一行只把已经编码好的 limb 放到计算设备；之后 Newton 和 Gauss 看到的始终是这种定点数组。</li>
+    </ol>
+  </section>
+
+  <section id="multiply"><h2>3. 第二步：一百万位整数怎样相乘</h2>
+    <p>Newton 和 Gauss 迭代几乎都可以归结为乘法。把 base-100 数组看成多项式：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>A</mi><mo>(</mo><mi>x</mi><mo>)</mo><mo>=</mo><msub><mi>a</mi><mn>0</mn></msub><mo>+</mo><msub><mi>a</mi><mn>1</mn></msub><mi>x</mi><mo>+</mo><msub><mi>a</mi><mn>2</mn></msub><msup><mi>x</mi><mn>2</mn></msup><mo>+</mo><mo>⋯</mo><mo>,</mo><mspace width="1em"/><mi>x</mi><mo>=</mo><mn>100</mn></mrow></math><span>纯文本：数组元素是多项式系数；把 x 换成 100，恰好恢复原来的大整数。</span></div>
+    <p>乘积第 <code>k</code> 个原始系数是所有满足 <code>i+j=k</code> 的 <code>a[i]×b[j]</code> 之和，这叫<strong>卷积</strong>。例如：</p>
+    <pre><code>0.1234  → limbs [34, 12]
+0.5678  → limbs [78, 56]
+
+原始卷积：
+c0 = 34×78            = 2652
+c1 = 34×56 + 12×78    = 2840
+c2 = 12×56            =  672
+
+按 base 100 进位：[2652,2840,672] → [52,66,0,7]
+完整乘积：0.07006652</code></pre>
+    <p>若直接做所有配对，需要约 <code>N²</code> 次乘法。FFT 把卷积变成“变换—逐点相乘—逆变换”，工作量降到约 <code>N log N</code>，因此百万位才实际可算。</p>
+    <figure>
+      <svg viewBox="0 0 1000 330" role="img" aria-labelledby="p3title p3desc"><title id="p3title">定点大数乘法的数学流水线</title><desc id="p3desc">两个 base-100 数组经过 FFT 卷积、整数舍入、进位和丢弃低位缩放，得到同精度的定点乘积。</desc>
+        <defs><marker id="pc" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#2457d6"/></marker></defs>
+        <g text-anchor="middle"><rect x="25" y="112" width="145" height="90" rx="12" fill="#fff" stroke="#2457d6"/><text x="97" y="146" font-size="17">X、Y limb</text><text x="97" y="174" font-size="14">各代表 xS、yS</text>
+        <rect x="210" y="112" width="145" height="90" rx="12" fill="#eaf1ff" stroke="#2457d6"/><text x="282" y="146" font-size="17">FFT 卷积</text><text x="282" y="174" font-size="14">得到 XY 的系数</text>
+        <rect x="395" y="112" width="145" height="90" rx="12" fill="#fff3df" stroke="#d58a35"/><text x="467" y="146" font-size="17">四舍五入</text><text x="467" y="174" font-size="14">恢复精确整数系数</text>
+        <rect x="580" y="112" width="145" height="90" rx="12" fill="#fff" stroke="#2457d6"/><text x="652" y="146" font-size="17">base-100 进位</text><text x="652" y="174" font-size="14">每格回到 0…99</text>
+        <rect x="765" y="112" width="205" height="90" rx="12" fill="#edf9f4" stroke="#147d4f"/><text x="867" y="144" font-size="17">丢弃最低 D 位</text><text x="867" y="170" font-size="14">等价于 floor(XY/S)</text><text x="867" y="190" font-size="14">结果仍代表 xy</text></g>
+        <g fill="none" stroke="#2457d6" stroke-width="3" marker-end="url(#pc)"><path d="M170 157 H202"/><path d="M355 157 H387"/><path d="M540 157 H572"/><path d="M725 157 H757"/></g>
+        <text x="500" y="65" text-anchor="middle" font-size="21" font-weight="700">一次定点乘法：Z = floor(XY / S)</text>
+        <text x="500" y="270" text-anchor="middle" font-size="16" fill="#596477">正式运行中最大 FFT 舍入残差为 1.07288360596e-06，远小于会舍错整数的 0.5</text>
+      </svg>
+      <figcaption>进位在实现中用并行前缀扫描完成，但从数值原理看，它与纸笔乘法后的十进制进位完全相同；这是工程加速，不改变结果。</figcaption>
+    </figure>
+
+    <h3>对应源码：FFT 卷积与定点缩放</h3>
+    <div class="code-title">pi_gpu.py</div>
+    <pre class="excerpt"><code>    def convolve_limbs(self, left, right):
+        """Exact limb convolution via float64 FFT plus checked integer rounding."""
+        self._check_pair(left, right, require_context_length=False)
+        # 长度 n 和 m 的多项式卷积共有 n+m-1 个原始系数
+        conv_length = left.numel() + right.numel() - 1
+        # One additional zero coefficient is required for the final normalized
+        # carry (e.g. 99 * 99 is a two-limb result although its raw convolution
+        # has one coefficient).
+        # 再留一格接收最高位的 base-100 进位
+        product_length = left.numel() + right.numel()
+        # 补零到 2 的幂，避免 FFT 的循环卷积绕回低位
+        fft_length = _next_power_of_two(product_length)
+        # 补零到 2 的幂，避免 FFT 的循环卷积绕回低位
+        self.max_fft_length = max(self.max_fft_length, fft_length)
+        # 把第一个 limb 序列变换到频域
+        left_fft = torch.fft.rfft(left.to(torch.float64), n=fft_length)
+        if left.data_ptr() == right.data_ptr() and left.numel() == right.numel():
+            right_fft = left_fft
+        else:
+            # 第二个序列也做同样变换
+            right_fft = torch.fft.rfft(right.to(torch.float64), n=fft_length)
+        # 频域逐点相乘后逆变换，得到近似卷积系数
+        raw = torch.fft.irfft(left_fft * right_fft, n=fft_length)
+        # 理论系数是整数，因此舍入到最近整数
+        rounded_float = torch.round(raw)
+        # 检查逆 FFT 结果离整数有多远
+        residual = torch.max(torch.abs(raw - rounded_float))
+        # 检查逆 FFT 结果离整数有多远
+        self.max_fft_residual = torch.maximum(self.max_fft_residual, residual)
+        _async_assert(residual.le(FFT_RESIDUAL_LIMIT), "FFT rounding residual exceeded 0.1")
+        # 从 float64 转回真正的 int64 系数
+        rounded = rounded_float.to(torch.int64)
+        if conv_length &lt; fft_length:
+            rounded[conv_length:] = 0
+        _async_assert(torch.all(rounded &gt;= 0), "FFT rounded to a negative coefficient")
+        # 计算最坏卷积系数上界，供进位归一化使用
+        coefficient_bound = (BASE - 1) ** 2 * min(left.numel(), right.numel())
+        # 完成 base-100 进位，使每格重新落到 0…99
+        result = self.normalize_nonnegative(rounded, coefficient_bound)
+        self.operations["fft_multiply"] += 1
+        self.operations["rfft"] += 1 if right_fft is left_fft else 2
+        self.operations["irfft"] += 1
+        return result[:product_length]
+</code></pre>
+    <ol class="code-notes">
+      <li><code>conv_length = len(A)+len(B)-1</code> 是普通多项式乘积的系数数目；额外的 <code>product_length</code> 格用来接收最高位进位。</li>
+      <li><code>rfft</code> 把两个 limb 序列变到频域，<code>left_fft * right_fft</code> 是逐点相乘，<code>irfft</code> 把它还原成卷积系数。这里并没有把 π 变成频率；FFT 只是快速完成大整数乘法。</li>
+      <li><code>torch.round(raw)</code> 把浮点 FFT 的近似结果还原成整数系数。紧接着计算的 <code>residual</code> 是“离最近整数还有多远”；超过 0.1 便立即判错。</li>
+      <li><code>normalize_nonnegative</code> 完成 base-100 进位，使每格重新落在 0…99。传入的上界说明最坏系数也在可安全舍入范围内。</li>
+      <li>左右参数指向同一张量时就是平方；代码复用一次正向 FFT，但数学结果仍是同一个卷积。</li>
+    </ol>
+    <div class="code-title">pi_gpu.py · FixedPointCUDA.mul（教学注释版）</div>
+    <pre class="excerpt"><code>    def mul(self, left, right):
+        self._check_pair(left, right)
+        # 先得到完整整数积 XY，它代表 xyS²
+        normalized = self.convolve_limbs(left, right)
+        # 跳过最低 F 个 limb，等价于除以 S=100^F
+        start = self.fractional_limbs
+        # 只保留固定精度所需的同样长度
+        stop = start + self.limb_count
+        result = torch.zeros(self.limb_count, dtype=torch.int64, device=self.device)
+        # 这是 floor(XY/S) 对应的 limb 区间
+        available = normalized[start : min(stop, normalized.numel())]
+        # 复制到新的定长定点数组，供下一轮继续使用
+        result[: available.numel()] = available
+        if normalized.numel() &gt; stop:
+            _async_assert(torch.all(normalized[stop:] == 0), "fixed-point multiplication overflow")
+        return result
+</code></pre>
+    <ol class="code-notes">
+      <li><code>convolve_limbs</code> 得到的是代表 <code>XY≈xyS²</code> 的完整整数积。</li>
+      <li><code>start = self.fractional_limbs</code> 后从第 <code>F</code> 个 limb 开始截取，正好丢掉低端的 <code>100^F=S</code> 因子，也就是执行 <code>floor(XY/S)</code>。</li>
+      <li>截取后的数组长度重新回到 <code>limb_count</code>，所以它可直接送入下一轮乘法；这就是所有迭代始终保持同一百万位尺度的原因。</li>
+    </ol>
+  </section>
+
+  <section id="newton"><h2>4. 第三步：不用长除法，怎样求倒数和平方根</h2>
+    <h3>倒数：误差真的会平方</h3>
+    <p>想求 <code>1/x</code>，先有一个很粗的猜测 <code>y</code>，再反复执行：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msup><mi>y</mi><mo>′</mo></msup><mo>=</mo><mi>y</mi><mo>(</mo><mn>2</mn><mo>−</mo><mi>x</mi><mi>y</mi><mo>)</mo></mrow></math><span>纯文本：新猜测 y'=y(2−xy)。右边只有乘法和减法。</span></div>
+    <p>令当前相对误差 <code>e=1−xy</code>。代入上式可直接算出：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mn>1</mn><mo>−</mo><mi>x</mi><msup><mi>y</mi><mo>′</mo></msup><mo>=</mo><msup><mrow><mo>(</mo><mn>1</mn><mo>−</mo><mi>x</mi><mi>y</mi><mo>)</mo></mrow><mn>2</mn></msup><mo>=</mo><msup><mi>e</mi><mn>2</mn></msup></mrow></math><span>纯文本：更新后的误差正好是原误差的平方。0.01 变成 0.0001，正确位数约翻倍。</span></div>
+    <h3>平方根：先求倒平方根</h3>
+    <p>Gauss 迭代需要 <code>√(ab)</code>。程序先令 <code>y≈1/√x</code>，使用：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msup><mi>y</mi><mo>′</mo></msup><mo>=</mo><mfrac><mrow><mi>y</mi><mo>(</mo><mn>3</mn><mo>−</mo><mi>x</mi><msup><mi>y</mi><mn>2</mn></msup><mo>)</mo></mrow><mn>2</mn></mfrac><mo>,</mo><mspace width="1em"/><msqrt><mi>x</mi></msqrt><mo>≈</mo><mi>x</mi><mi>y</mi></mrow></math><span>纯文本：迭代得到 y≈1/√x，最后乘一次 x 得到 √x。</span></div>
+    <p>以 <code>x=2</code>、<code>y₀=1</code> 为例，序列是 <code>1 → 0.5 → 0.625 → 0.693359375 → 0.706708468… → 0.707106444…</code>，迅速逼近 <code>1/√2=0.707106781…</code>。正式程序每次执行 24 轮；每一轮的乘法都是上一节的百万位定点乘法。</p>
+
+    <h3>对应源码：reciprocal / inverse_sqrt / sqrt</h3>
+    <div class="code-title">pi_gpu.py</div>
+    <pre class="excerpt"><code>    def reciprocal(self, value, iterations=24):
+        """Newton reciprocal y &lt;- y(2-xy), for the final denominator near one."""
+        self._check(value)
+        y = self.literal("1")
+        # 常量 2 与 x、y 使用完全相同的定点尺度
+        two = self.literal("2")
+        for _ in range(iterations):
+            # 这一行逐字实现 y ← y(2-xy)
+            y = self.mul(y, self.sub(two, self.mul(value, y)))
+            self.operations["reciprocal_iteration"] += 1
+        return y
+    def inverse_sqrt(self, value, iterations=24):
+        """Newton inverse square root y &lt;- y(3-xy^2)/2."""
+        self._check(value)
+        y = self.literal("1")
+        # 倒平方根公式需要同尺度常量 3
+        three = self.literal("3")
+        for _ in range(iterations):
+            # 先计算 y²
+            y_squared = self.mul(y, y)
+            # 再形成修正量 3-xy²
+            correction = self.sub(three, self.mul(value, y_squared))
+            # 计算 y(3-xy²)/2，误差在此近似平方
+            y = self.div2(self.mul(y, correction))
+            self.operations["inverse_sqrt_iteration"] += 1
+        return y
+    def sqrt(self, value, iterations=24):
+        # sqrt(x)=x×(1/sqrt(x))
+        return self.mul(value, self.inverse_sqrt(value, iterations))
+</code></pre>
+    <ol class="code-notes">
+      <li>倒数函数从定点常量 <code>y=1</code> 开始。内层 <code>self.mul(value, y)</code> 是 <code>xy</code>，<code>self.sub(two, ...)</code> 是 <code>2−xy</code>，外层乘法于是完整对应 <code>y(2−xy)</code>。</li>
+      <li>倒平方根先算 <code>y_squared=y²</code>，再算 <code>correction=3−xy²</code>，最后执行 <code>y×correction/2</code>；变量名就是公式中的每一项。</li>
+      <li><code>div2</code> 不是降低精度的普通浮点除法，而是在 base-100 定点数组上精确做整数除 2。</li>
+      <li><code>sqrt</code> 只做最后一步 <code>x×(1/√x)</code>。因此代码从未实现复杂的百万位长除法或逐位开方，全部复用了已经解释过的乘法。</li>
+      <li><code>iterations=24</code> 是固定上限；由于误差反复平方，后面的轮次一次修正成倍增加的正确位。</li>
+    </ol>
+  </section>
+
+  <section id="gauss"><h2>5. 核心：Gauss–Legendre 为什么会算出 π</h2>
+    <h3>四个变量从哪里开始</h3>
+    <pre><code>a₀ = 1
+b₀ = 1/√2
+t₀ = 1/4
+p₀ = 1</code></pre>
+    <p><code>a</code> 与 <code>b</code> 分别做算术平均和几何平均。对正数而言，几何平均不大于算术平均，所以二者会从上下两侧快速靠近同一个极限，这个极限叫 AGM（算术—几何平均）。</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>a</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><mfrac><mrow><msub><mi>a</mi><mi>n</mi></msub><mo>+</mo><msub><mi>b</mi><mi>n</mi></msub></mrow><mn>2</mn></mfrac><mo>,</mo><mspace width="1em"/><msub><mi>b</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msqrt><mrow><msub><mi>a</mi><mi>n</mi></msub><msub><mi>b</mi><mi>n</mi></msub></mrow></msqrt></mrow></math><span>纯文本：下一轮 a 是算术平均，b 是几何平均。</span></div>
+    <p><code>t</code> 累计每轮两个平均数之间的“差距能量”，<code>p</code> 每轮加倍：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>t</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msub><mi>t</mi><mi>n</mi></msub><mo>−</mo><msub><mi>p</mi><mi>n</mi></msub><msup><mrow><mo>(</mo><msub><mi>a</mi><mi>n</mi></msub><mo>−</mo><msub><mi>a</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>)</mo></mrow><mn>2</mn></msup><mo>,</mo><mspace width="1em"/><msub><mi>p</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><mn>2</mn><msub><mi>p</mi><mi>n</mi></msub></mrow></math><span>纯文本：t 减去加权平方差，p 变成两倍。</span></div>
+    <p>每一轮都可以形成一个 π 的近似：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>π</mi><mi>n</mi></msub><mo>=</mo><mfrac><msup><mrow><mo>(</mo><msub><mi>a</mi><mi>n</mi></msub><mo>+</mo><msub><mi>b</mi><mi>n</mi></msub><mo>)</mo></mrow><mn>2</mn></msup><mrow><mn>4</mn><msub><mi>t</mi><mi>n</mi></msub></mrow></mfrac></mrow></math><span>纯文本：πₙ=(aₙ+bₙ)²/(4tₙ)。程序最后实际计算的就是这一式。</span></div>
+
+    <h3>把第一轮逐项算出来</h3>
+    <p>先暂时只看十几位小数，正式程序只是把每一行换成拥有 1000256 位的定点整数运算：</p>
+    <pre><code>b₀ = 1/√2
+   = 0.7071067811865475…
+
+a₁ = (a₀+b₀)/2
+   = (1+0.7071067811865475…)/2
+   = 0.8535533905932737…
+
+b₁ = √(a₀b₀)
+   = √(1×0.7071067811865475…)
+   = 0.8408964152537145…
+
+t₁ = t₀-p₀(a₀-a₁)²
+   = 0.25-1×(1-0.8535533905932737…)²
+   = 0.2285533905932737…
+
+p₁ = 2
+
+π₁ = (a₁+b₁)²/(4t₁)
+   = 3.140579250522168…</code></pre>
+    <p>第一轮还不够准，但它展示了数字的真实来源：没有查表，只有平均、乘法、平方根、平方和一次除法。下一轮把这里得到的 <code>a₁,b₁,t₁,p₁</code> 原样代回同一组公式。</p>
+
+    <h3>为什么这不是“碰巧接近 π”</h3>
+    <p>背后的桥梁是完全椭圆积分：</p>
+    <div class="formula"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>K</mi><mo>(</mo><mi>k</mi><mo>)</mo><mo>=</mo><msubsup><mo>∫</mo><mn>0</mn><mfrac><mi>π</mi><mn>2</mn></mfrac></msubsup><mfrac><mrow><mo>d</mo><mi>θ</mi></mrow><msqrt><mrow><mn>1</mn><mo>−</mo><msup><mi>k</mi><mn>2</mn></msup><msup><mrow><mi>sin</mi><mi>θ</mi></mrow><mn>2</mn></msup></mrow></msqrt></mfrac><mo>=</mo><mfrac><mi>π</mi><mrow><mn>2</mn><mi>AGM</mi><mo>(</mo><mn>1</mn><mo>,</mo><msqrt><mrow><mn>1</mn><mo>−</mo><msup><mi>k</mi><mn>2</mn></msup></mrow></msqrt><mo>)</mo></mrow></mfrac></mrow></math><span>纯文本：Gauss 证明，椭圆积分 K 可以用算术—几何平均 AGM 表示，而式中明确含有 π。</span></div>
+    <p>选择 <code>k=1/√2</code> 时，它的互补参数仍是 <code>1/√2</code>。Legendre 恒等式把这个对称情形中的两个椭圆积分合并；上面由平方差累计出来的 <code>t</code> 正好记录其中第二类积分的修正项。最终得到严格恒等式 <code>π=M²/t∞</code>，其中 <code>M=AGM(1,1/√2)</code>。当 <code>a</code>、<code>b</code> 都趋于 <code>M</code> 时，<code>(a+b)²/(4t)</code> 就趋于 π。也就是说，初始化中的 <code>1/√2</code>、每轮平方差和最后的除法是一套完整数学恒等式，不是经验拟合。</p>
+
+    <h3>亲眼看前四轮</h3>
+    <table><thead><tr><th>轮数 n</th><th>aₙ</th><th>bₙ</th><th>由 (a+b)²/(4t) 得到</th></tr></thead><tbody>
+      <tr><td>0</td><td>1</td><td>0.7071067811865475…</td><td>2.914213562373095…</td></tr>
+      <tr><td>1</td><td>0.8535533905932737…</td><td>0.8408964152537145…</td><td>3.140579250522168…</td></tr>
+      <tr><td>2</td><td>0.8472249029234941…</td><td>0.8472012667468914…</td><td>3.141592646213542…</td></tr>
+      <tr><td>3</td><td>0.8472130848351928…</td><td>0.8472130847527653…</td><td>3.1415926535897932382795…</td></tr>
+      <tr><td>4</td><td>0.8472130847939790866070…</td><td>0.8472130847939790866059…</td><td>3.141592653589793238462643383279502884197…</td></tr>
+    </tbody></table>
+    <p>第 1 轮只有开头少量数字正确，第 2 轮已有约 7 个小数位，第 3 轮约 18 位，第 4 轮约 40 位；此后正确位数继续近似翻倍。</p>
+    <figure>
+      <svg viewBox="0 0 1000 390" role="img" aria-labelledby="p4title p4desc"><title id="p4title">正确位数逐轮翻倍</title><desc id="p4desc">Gauss 迭代使误差近似平方，因此正确二进制位数量按 1、2、4、8 一直增长；22 次翻倍达到约 419 万位，超过所需约 332 万二进制位。</desc>
+        <text x="500" y="47" text-anchor="middle" font-size="22" font-weight="700">为什么固定做 22 轮</text>
+        <line x1="95" y1="300" x2="930" y2="300" stroke="#9aa7ba" stroke-width="2"/>
+        <g fill="#2457d6"><rect x="130" y="270" width="80" height="30" rx="5"/><rect x="260" y="235" width="80" height="65" rx="5"/><rect x="390" y="190" width="80" height="110" rx="5"/><rect x="520" y="135" width="80" height="165" rx="5"/><rect x="650" y="78" width="80" height="222" rx="5"/></g>
+        <g text-anchor="middle" font-size="16"><text x="170" y="326">粗略初值</text><text x="300" y="326">误差平方</text><text x="430" y="326">再次平方</text><text x="560" y="326">…</text><text x="690" y="326">22 轮</text>
+        <text x="170" y="260">约 1 份</text><text x="300" y="225">约 2 份</text><text x="430" y="180">约 4 份</text><text x="560" y="125">指数增长</text><text x="690" y="68">2²²=4,194,304</text></g>
+        <path d="M770 112 H920" stroke="#147d4f" stroke-width="5"/><text x="845" y="98" text-anchor="middle" font-size="15">所需约 3322779 bit</text><text x="845" y="145" text-anchor="middle" font-size="14" fill="#596477">D×log₂10</text>
+        <text x="500" y="365" text-anchor="middle" font-size="16" fill="#596477">这是“正确位数翻倍”的量级直觉；正式结果还由保护位和逐位比较兜底</text>
+      </svg>
+      <figcaption>1000256 个十进制位约等于 3322779 个二进制位，而 2²²=4,194,304。经过最初几轮进入二次收敛区后，22 轮给出足够余量。</figcaption>
+    </figure>
+
+    <h3>对应源码：22 轮公式如何排列</h3>
+    <div class="code-title">pi_gpu.py</div>
+    <pre class="excerpt"><code>def compute_pi_digits(digits, guard_digits, device="cuda:0", gauss_iterations=22,
+                      newton_iterations=24):
+    """Return (CUDA uint8 decimal digits, arithmetic context)."""
+    # 建立统一的 D 位定点运算环境
+    context = FixedPointCUDA(digits, guard_digits, device=device)
+    # 精确写入 a0=1，并由它得到 1/2
+    one = context.literal("1")
+    half = context.div2(one)
+    a = one
+    # b0=sqrt(1/2)=1/sqrt(2)
+    b = context.sqrt(half, newton_iterations)
+    # 精确写入 t0=1/4
+    t = context.literal("0.25")
+    p = 1
+
+    # 下面四个更新固定重复 22 轮
+    for _ in range(gauss_iterations):
+        # 算术平均：a'=(a+b)/2
+        a_next = context.div2(context.add(a, b))
+        # 几何平均：b'=sqrt(ab)
+        b_next = context.sqrt(context.mul(a, b), newton_iterations)
+        # 差值 a-a' 决定本轮 t 的修正量
+        difference = context.sub(a, a_next)
+        # 计算 p(a-a')²
+        correction = context.mul_small(context.mul(difference, difference), p)
+        # t'=t-p(a-a')²
+        t = context.sub(t, correction)
+        a, b = a_next, b_next
+        # 下一轮平方差的权重加倍
+        p *= 2
+        context.operations["gauss_legendre_iteration"] += 1
+
+    # 最终公式的分子：(a+b)²
+    numerator = context.mul(context.add(a, b), context.add(a, b))
+    # 最终公式的分母：4t
+    denominator = context.mul_small(t, 4)
+    # 除以 4t 改写成乘以 Newton 求出的倒数
+    pi_value = context.mul(numerator, context.reciprocal(denominator, newton_iterations))
+    # 把 π 的定点数组展开成目标十进制数字
+    return context.decimal_digits(pi_value, digits), context
+</code></pre>
+    <ol class="code-notes">
+      <li><code>one</code>、<code>half</code>、<code>a</code>、<code>t</code> 和 <code>p</code> 对应初始化表。<code>b=context.sqrt(half)</code> 正是 <code>b₀=√(1/2)=1/√2</code>。</li>
+      <li><code>a_next</code> 和 <code>b_next</code> 是算术平均、几何平均两行公式；这里的 <code>context.mul(a,b)</code> 先得到 <code>ab</code>，再交给刚才解释的 Newton 平方根。</li>
+      <li><code>difference=a−a_next</code>，接下来平方并乘 Python 小整数 <code>p</code>，得到 <code>p(a−a')²</code>；<code>t=context.sub(t,correction)</code> 完成 t 的更新。</li>
+      <li><code>p *= 2</code> 只是更新下一轮的权重。<code>p</code> 本身很小，所以乘它不需要再做一次 FFT。</li>
+      <li>循环结束后，<code>numerator=(a+b)²</code>，<code>denominator=4t</code>；先用 Newton 得到分母倒数，再与分子相乘，严格对应 <code>(a+b)²/(4t)</code>。</li>
+      <li>函数最后没有生成字符串，而是调用 <code>decimal_digits</code> 返回仍在计算设备上的数字张量。下一节解释它怎样成为恰好一百万个字符。</li>
+    </ol>
+  </section>
+
+  <section id="walkthrough"><h2>6. 把所有部分接起来：从 1 到一百万位</h2>
+    <ol class="steps">
+      <li><strong>确定小数点位置。</strong>设 <code>D=1000256</code>，所有数都存成约等于真实值乘 <code>S=10^D</code> 的 base-100 整数数组。数组有 500128 个小数 limb 和 2 个整数 limb。</li>
+      <li><strong>写入精确常量。</strong><code>a=1</code>、<code>t=1/4</code>、<code>p=1</code> 都能在十进制定点中精确表示；<code>1/2</code> 也精确。</li>
+      <li><strong>算出 b₀。</strong>对 <code>x=1/2</code> 做 24 轮倒平方根迭代，再乘 <code>x</code>，得到 <code>√(1/2)=1/√2</code> 的 1000256 位定点近似。</li>
+      <li><strong>执行 22 轮。</strong>每轮先算 <code>(a+b)/2</code>，再用 Newton 算 <code>√(ab)</code>，然后用 <code>t←t−p(a−a')²</code> 修正 <code>t</code>，最后令 <code>p←2p</code>。每个乘号都走 FFT 定点乘法。</li>
+      <li><strong>形成分子和分母。</strong>分子 <code>N=(a+b)²</code>；分母 <code>Q=4t</code>。此时 <code>N/Q</code> 已在 1000256 位范围内逼近 π。</li>
+      <li><strong>把除法改成乘法。</strong>对 <code>Q</code> 做 24 轮 <code>y←y(2−Qy)</code> 得到 <code>y≈1/Q</code>，再算 <code>P=N×y</code>。<code>P</code> 就是 π 的最终定点数组。</li>
+      <li><strong>把 limb 变成字符。</strong>从整数小数点旁边开始反向读取 500000 个 limb；每个值 <code>v</code> 输出 <code>v//10</code> 和 <code>v%10</code> 两个数字。这样正好得到 1,000,000 个数字。</li>
+      <li><strong>保护位不输出。</strong>最深处 128 个 limb 只承受前面多次截断造成的误差，最终直接丢弃。结果于是是目标前缀，而不是被边界舍入污染的尾部。</li>
+    </ol>
+    <pre><code># 数学伪代码；每个变量实际上都是长度相同的定点 limb 数组
+a = 1
+b = sqrt(1/2)                 # Newton 倒平方根
+t = 1/4
+p = 1
+
+repeat 22 times:
+    next_a = (a + b) / 2
+    next_b = sqrt(a * b)      # Newton + FFT 定点乘法
+    t = t - p * (a - next_a)^2
+    a, b = next_a, next_b
+    p = 2 * p
+
+pi_fixed = (a + b)^2 * reciprocal(4 * t)
+digits = 从 pi_fixed 依次拆出前 1,000,000 个小数数字</code></pre>
+
+    <h3>对应源码：最后一百万位如何从 limb 中读出</h3>
+    <div class="code-title">pi_gpu.py</div>
+    <pre class="excerpt"><code>    def decimal_digits(self, value, count):
+        """Return fractional decimal digits as a CUDA uint8 tensor."""
+        self._check(value)
+        # 每个 limb 提供两位，所以一百万位需要 500,000 个 limb
+        pairs = (int(count) + 1) // 2
+        if pairs &gt; self.fractional_limbs:
+            raise ValueError("requested digits exceed fixed-point precision")
+        # 取小数点旁的目标 limb；更深的保护位不在切片中
+        # 存储是小端，显示前先反转成从高位到低位
+        pair_values = torch.flip(
+            value[self.fractional_limbs - pairs : self.fractional_limbs], dims=(0,)
+        )
+        # 为逐个十进制数字分配 uint8 输出张量
+        digits = torch.empty(2 * pairs, dtype=torch.uint8, device=self.device)
+        # 每个 limb 的十位写到第 1、3、5…个位置
+        digits[0::2] = torch.div(pair_values, 10, rounding_mode="floor").to(torch.uint8)
+        # 每个 limb 的个位写到第 2、4、6…个位置
+        digits[1::2] = torch.remainder(pair_values, 10).to(torch.uint8)
+        # 若请求奇数位，在这里裁掉最后多出的一位
+        return digits[:count]
+</code></pre>
+    <ol class="code-notes">
+      <li><code>pairs=(count+1)//2</code> 把目标数字数换成 limb 数；一百万位正好是 500,000 对。</li>
+      <li>数组是小端的，所以切片先取小数点下方所需的 500,000 格，再用 <code>torch.flip</code> 反转成阅读顺序。更深的 128 个保护 limb 没进入这个切片。</li>
+      <li><code>digits[0::2]=pair_values//10</code> 取每个 limb 的十位，填入第 1、3、5…个位置；<code>digits[1::2]=pair_values%10</code> 取个位，填入第 2、4、6…个位置。</li>
+      <li>结果类型是 <code>uint8</code>，每个元素仍是数值 0…9。通过逐位比较后，CPU 才给每项加字符 <code>'0'</code> 并写成文本。</li>
+      <li>因此第 1,000,000 位对应最后一个 <code>pair_values</code> 的 <code>%10</code> 分支，这正是第 500,000 个目标 limb 的个位。</li>
+    </ol>
+    <div class="answer"><strong>现在可以精确回答“第 1,000,000 位怎么来的”：</strong>它是最终 <code>pi_fixed</code> 数组中第 500,000 个目标小数 limb 的个位。该 limb 是 22 轮 Gauss 更新中所有定点加减、FFT 乘法和 Newton 平方根共同算出的。本次该数字是 <strong>1</strong>。</div>
+  </section>
+
+  <section id="proof"><h2>7. 怎样确认这一百万位不是“看起来像对”</h2>
+    <p>工程验收只保留与数值可信度直接相关的三件事：</p>
+    <ol>
+      <li><strong>256 个保护位：</strong>所有运算内部多算这些位，输出时丢弃。</li>
+      <li><strong>FFT 可舍入性：</strong>最大观测残差是 <code>1.07288360596e-06</code>，小于验收阈值 <code>0.1</code>，更远小于舍错整数所需的 0.5。</li>
+      <li><strong>两个独立参考：</strong>两份参考先互比，再分别与计算结果在计算设备上逐位比较；mismatch 分别为 <code>[0, 0]</code>。</li>
+    </ol>
+    <div class="proof"><strong>验收结论：</strong>计算结果 mismatch=0，参考之间 mismatch=0，状态为 <code>passed</code>。</div>
+    <p>首 100 位：</p><div class="digits">3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679</div>
+    <p>末 100 位：</p><div class="digits">…0315614033321272849194418437150696552087542450598956787961303311646283996346460422090106105779458151</div>
+  </section>
+
+</main>
+<footer>数学延伸阅读：<a href="https://maths-people.anu.edu.au/~brent/pub/pub034.html">Brent–Salamin 算法原论文页面</a>。</footer>
+</body>
+</html>
