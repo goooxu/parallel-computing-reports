@@ -281,7 +281,7 @@ c2 = 12×56            =  672
       <li><code>normalize_nonnegative</code> 完成 base-100 进位，使每格重新落在 0…99。传入的上界说明最坏系数也在可安全舍入范围内。</li>
       <li>左右参数指向同一张量时就是平方；代码复用一次正向 FFT，但数学结果仍是同一个卷积。</li>
     </ol>
-    <div class="code-title">pi_gpu.py · FixedPointCUDA.mul（教学注释版）</div>
+    <div class="code-title">pi_gpu.py</div>
     <pre class="excerpt"><code>    def mul(self, left, right):
         self._check_pair(left, right)
         # 先得到完整整数积 XY，它代表 xyS²
