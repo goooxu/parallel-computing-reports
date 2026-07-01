@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>圆周未央，万核同数 —— 在 GPU 上使用 PyTorch 计算 π 的小数点后 100 万位</title>
+<title>圆周未央，万核同数 —— 在 GPU 上使用 PyTorch 计算 π 的小数点后 100 万位（Chudnovsky 方法）</title>
 <style>
   :root{--ink:#1c2330;--muted:#5b6577;--line:#e2e6ee;--accent:#2f6df6;--good:#0f8a4d;--warn:#b45309;--box:#f6f8fc}
   *{box-sizing:border-box}
@@ -39,7 +39,7 @@
 </style></head><body><div class="wrap">
 
 <h1>圆周未央，万核同数</h1>
-<p class="lead">在 GPU 上使用 PyTorch 计算 π 的小数点后 100 万位</p>
+<p class="lead">在 GPU 上使用 PyTorch 计算 π 的小数点后 100 万位（Chudnovsky 方法）</p>
 
 <div class="box key"><b>一句话总结。</b> 只用 PyTorch，在一块 GPU 上从零实现「大整数运算」，
 再用收敛极快的 Chudnovsky 公式把 π 算到小数点后 <b>100 万位</b>，与公开权威数据逐位比对——<b>全部一致</b>。
