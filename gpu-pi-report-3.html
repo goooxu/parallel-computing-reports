@@ -1,0 +1,1208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>九转圆周，殊途同归 —— 在 GPU 上用 Gauss–Legendre 迭代计算 π 的一百万位</title>
+    <style>
+        :root {
+            --ink: #1c2733;
+            --muted: #5b6b7b;
+            --acc: #2c5f8f;
+            --bg: #fbfbf9;
+            --box: #f2f5f8;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+            color: var(--ink);
+            background: var(--bg);
+            margin: 0;
+            line-height: 1.75;
+        }
+
+        main {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 24px 20px 80px;
+        }
+
+        h1 {
+            font-size: 30px;
+            margin: 26px 0 4px;
+        }
+
+        h2 {
+            font-size: 22px;
+            margin: 44px 0 10px;
+            border-left: 5px solid var(--acc);
+            padding-left: 12px;
+        }
+
+        h3 {
+            font-size: 17px;
+            margin: 28px 0 8px;
+            color: var(--acc);
+        }
+
+        p {
+            margin: 10px 0;
+        }
+
+        .subtitle {
+            color: var(--muted);
+            font-size: 16px;
+            margin-bottom: 2px;
+        }
+
+        .meta {
+            color: var(--muted);
+            font-size: 13px;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 14px;
+        }
+
+        .callout {
+            background: var(--box);
+            border-left: 4px solid var(--acc);
+            padding: 10px 16px;
+            border-radius: 0 8px 8px 0;
+            margin: 14px 0;
+        }
+
+        .warn {
+            border-left-color: #c07a3a;
+        }
+
+        .grid2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+            margin: 14px 0;
+        }
+
+        @media(max-width:680px) {
+            .grid2 {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .gbox {
+            background: var(--box);
+            border: 1px solid #e2e6ea;
+            border-radius: 8px;
+            padding: 10px 14px;
+        }
+
+        pre.code {
+            background: #20262e;
+            color: #e8edf2;
+            padding: 14px 16px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-size: 13px;
+            line-height: 1.55;
+        }
+
+        pre.code code {
+            font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+        }
+
+        code {
+            font-family: Consolas, monospace;
+            background: #edf0f3;
+            padding: 1px 5px;
+            border-radius: 4px;
+            font-size: 0.92em;
+        }
+
+        pre.code code {
+            background: none;
+            padding: 0;
+        }
+
+        table {
+            border-collapse: collapse;
+            margin: 14px 0;
+            width: 100%;
+            font-size: 14px;
+        }
+
+        th,
+        td {
+            border: 1px solid #d6dce2;
+            padding: 7px 10px;
+            text-align: left;
+        }
+
+        th {
+            background: #e8eef4;
+        }
+
+        td.num,
+        th.num {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        figure {
+            margin: 20px 0;
+            text-align: center;
+        }
+
+        figure svg {
+            width: 100%;
+            height: auto;
+            background: #fff;
+            border: 1px solid #e2e6ea;
+            border-radius: 8px;
+        }
+
+        figcaption {
+            color: var(--muted);
+            font-size: 13px;
+            margin-top: 6px;
+        }
+
+        .toc {
+            background: var(--box);
+            border-radius: 8px;
+            padding: 14px 22px;
+        }
+
+        .toc a {
+            color: var(--acc);
+            text-decoration: none;
+            display: block;
+        }
+
+        .digits {
+            font-family: Consolas, monospace;
+            font-size: 13px;
+            word-break: break-all;
+            background: #fff;
+            border: 1px dashed #bbb;
+            padding: 10px 12px;
+            border-radius: 6px;
+        }
+
+        math {
+            font-size: 1.08em;
+        }
+
+        math[display="block"] {
+            display: block;
+            margin: 6px auto;
+            overflow-x: auto;
+            max-width: 100%;
+        }
+
+        .mrow {
+            text-align: center;
+            margin: 12px 0;
+            background: var(--box);
+            border: 1px solid #e2e6ea;
+            border-radius: 8px;
+            padding: 8px 12px;
+        }
+
+        .small {
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        .pass {
+            color: #1c7c3c;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+    <main>
+        <h1>九转圆周，殊途同归</h1>
+        <p class="subtitle">在 GPU 上用 Gauss–Legendre 迭代计算 π 的 1,000,000 位 —— 从零实现大数运算，CuPy 与 CUDA C++（cuFFTDx +
+            cuBLASDx）两种实现与性能对比</p>
+        <p class="meta">不借助任何第三方大数学库：大整数的加、减、乘（FFT）、除、开方全部从零实现，结果与公开的 π
+            基准数据逐位比对通过。</p>
+        <div class="toc"><b>目录</b><br><a href="#c1">1. 结果一览</a><a href="#c2">2. 挑战：为什么不能直接算</a><a href="#c3">3.
+                并行的心法：从循环到整片数组</a><a href="#c4">4. 用 limb 数组表示大整数</a><a href="#c5">5. FFT 大整数乘法</a><a href="#c6">6.
+                牛顿迭代：除法与开方</a><a href="#c7">7. 选算法：收敛速度决定一切</a><a href="#c8">8. 定点缩放：让实数进整数库</a><a href="#c9">9.
+                牛顿迭代的两件武器：精度爬升与热启动</a><a href="#c10">10. 性能暗礁：999…9 进位长链</a><a href="#c11">11. 实现
+                1：CuPy</a><a href="#c12">12. 实现 2：自己搭一个百万点 FFT</a><a href="#c13">13. 性能对比与分析</a><a href="#c14">14.
+                正确性验证</a><a href="#c15">15. 结语</a></div>
+        <h2 id="c1">1. 结果一览</h2>
+        <p>两种实现跑在同一台机器上，算同样的 1,000,000 位 π，输出<b>逐字节一致</b>，并与公开基准数据逐位比对通过：</p>
+        <table>
+            <tr>
+                <th>实现</th>
+                <th>语言 / 库</th>
+                <th class="num">端到端耗时</th>
+                <th class="num">相对耗时</th>
+                <th>验证</th>
+            </tr>
+            <tr>
+                <td>实现 1</td>
+                <td>Python + CuPy 14.1.1（FFT 走 cuFFT）</td>
+                <td class="num">16.7 s</td>
+                <td class="num">1×</td>
+                <td class="pass">PASS</td>
+            </tr>
+            <tr>
+                <td>实现 2</td>
+                <td>CUDA C++ + cuFFTDx/cuBLASDx（自建大 FFT）</td>
+                <td class="num"><b>0.88 s</b></td>
+                <td class="num">19×</td>
+                <td class="pass">PASS</td>
+            </tr>
+        </table>
+        <div class="callout">路线图：第 2–6 节搭地基（为什么要自造大数、并行怎么想、limb 表示、FFT 乘法、牛顿迭代）；第 7–10 节讲算法与两项关键优化；第 11–12 节分别拆解两种实现；第
+            13–14 节是性能与验证。已熟悉高精度计算的读者可以直接从第 7 节读起。</div>
+        <h2 id="c2">2. 挑战：为什么不能直接算</h2>
+        <p><b>浮点数装不下。</b>C++ 的 <code>double</code>、Python 的 <code>float</code> 都是 64 位浮点数，只有约 15～16 位有效数字。要 100 万位，差了 5
+            个数量级——这不是精度不够，而是类型里根本没那么多位置。</p>
+        <p><b>GPU 上没有「大整数」。</b>Python 内置 <code>int</code> 虽是任意精度，但它在 CPU 上单线程运行；而 GPU 的数组库（如 CuPy——可以理解为「GPU
+            上的数组计算库」，数组默认就在显存里）只有<code>int64</code>、<code>float64</code>
+            这类<b>定长</b>数组。所以我们要<b>自己用一大片小数字（数组）拼出一个大数</b>，把大数的加减乘除翻译成<b>对整片数组的运算</b>，交给 GPU 上成千上万个核心并行完成。</p>
+        <h2 id="c3">3. 并行的心法：从「循环」到「整片数组」</h2>
+        <div class="grid2">
+            <div class="gbox"><b>CPU＝几位博士生</b><br>核心少但强，擅长「一步依赖上一步」的复杂逻辑；跑 <code>for</code> 循环是一次一格。</div>
+            <div class="gbox"><b>GPU＝上万名小学生</b><br>GPU 有数万个 CUDA 核心，每个只会简单算术，但能<b>同时开工</b>。</div>
+        </div>
+        <p>要用上 GPU，就得把「逐元素的循环」改写成「对整片数组的一次运算」：</p>
+        <figure><svg viewBox="0 0 720 190" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="13">
+                <text x="10" y="18" font-size="14" fill="#5b6b7b">串行 CPU：n 步</text><text x="430" y="18" font-size="14"
+                    fill="#5b6b7b">并行 GPU：一次</text>
+                <rect x="10" y="34" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3" />
+                <rect x="10" y="66" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3" />
+                <rect x="10" y="98" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3" />
+                <rect x="10" y="130" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3" />
+                <text x="78" y="52">a[0]=b[0]+c[0]</text><text x="78" y="84">a[1]=b[1]+c[1]</text><text x="78"
+                    y="116">a[2]=b[2]+c[2]</text><text x="78" y="148">…（第 n 步）</text>
+                <path d="M39 60 L39 66 M39 92 L39 98 M39 124 L39 130" stroke="#c07a3a" stroke-width="2" />
+                <g transform="translate(430,0)">
+                    <rect x="0" y="34" width="44" height="122" fill="#eefaf2" stroke="#8fd3ad" />
+                    <text x="7" y="52" fill="#1c7c3c">a[0]</text><text x="7" y="80" fill="#1c7c3c">a[1]</text><text
+                        x="7" y="108" fill="#1c7c3c">a[2]</text><text x="7" y="140" fill="#1c7c3c">a[n]</text>
+                    <text x="56" y="98">= b + c</text>
+                </g>
+            </svg>
+            <figcaption>图 1：左边 <code>for i: a[i]=b[i]+c[i]</code> 是 n 步顺序执行；右边 <code>a = b + c</code> 一次并行完成。
+            </figcaption>
+        </figure>
+        <div class="callout"><b>全文最重要的一句话：</b>后面每一个大数运算，我们都会把它写成「对整片 limb 数组的运算」，这样它才真正跑在 GPU
+            上。做不到这一点的运算（比如天生串行的逐位进位），就要找到它的并行等价形式——这正是第 10 节那场性能事故的主题。</div>
+        <h2 id="c4">4. 用 limb 数组表示大整数；加法与进位</h2>
+        <p><b>表示。</b>把大整数拆成许多 0～999 的小数字，每个叫一个 <b>limb</b>，整体是一个 <code>int64</code> 数组（低位在前）。选基
+            B=1000（=10³）是因为最终要输出十进制：每个 limb 恰好 3 位数字，<b>输出零成本</b>。100 万位的 π 就是约 33.4 万个 limb 的数组。</p>
+        <figure><svg viewBox="0 0 660 92" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="14">
+                <text x="10" y="16" font-size="12" fill="#5b6b7b">数值 12,345,678 = 678 + 345·1000 + 12·1000²</text>
+                <g transform="translate(0,28)">
+                    <rect x="20" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0" /><text x="52"
+                        y="25">12</text>
+                    <rect x="120" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0" /><text x="145"
+                        y="25">345</text>
+                    <rect x="220" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0" /><text x="245"
+                        y="25">678</text>
+                    <text x="20" y="55" font-size="11" fill="#5b6b7b">limb[2]（高位）</text><text x="230" y="55"
+                        font-size="11" fill="#5b6b7b">limb[0]（低位）</text>
+                </g>
+            </svg>
+            <figcaption>图 2：大整数 = limb 数组（小端，下标 0 是最低位）。</figcaption>
+        </figure>
+        <pre
+            class="code"><code>def from_int(n):                       # Python 整数 -&gt; limb 数组（只用于常数/种子）
+    limbs = []
+    while n &gt; 0:
+        limbs.append(n % 1000)         # 最低 3 位十进制作为一个 limb
+        n //= 1000
+    return cp.array(limbs, dtype=cp.int64)
+
+def to_decimal_str(x):                 # limb 数组 -&gt; 十进制字符串：每 limb 补足 3 位再拼接
+    return &quot;&quot;.join(&quot;%03d&quot; % int(d) for d in reversed(x.tolist())).lstrip(&quot;0&quot;)</code></pre>
+        <p><b>加法与进位。</b>小学的「逐位相加、逢千进一」是天生串行的（第 k 位的进位要等第 k−1 位）。GPU 上改成两步：先<b>整片相加</b>（有些 limb 暂时超过
+            999，不管它），再<b>整片传播进位</b>——每趟用一次整片除法算出所有 limb 的溢出 <code>q = c // 1000</code>，把它整体挪高一格加回去。溢出每趟缩小 1000 倍，几趟之后每个
+            limb 都落回 0～999 附近，只剩下 0/1 的「残余进位」。这些残余怎么<b>一次</b>收干净（而不是再一格格地挪），是第 10 节的主角——先按下不表：</p>
+        <pre class="code"><code>def add(x, y):
+    n = max(x.shape[0], y.shape[0])
+    x = cp.pad(x, (0, n - x.shape[0]))     # 补齐等长
+    y = cp.pad(y, (0, n - y.shape[0]))
+    return normalize(x + y)                # 整片相加，进位交给 normalize
+
+def normalize(c):                          # 有界趟：每趟把溢出整体上移一格
+    c = cp.pad(c, (0, 8))
+    while True:
+        q = c // 1000                      # 一次算出所有 limb 的溢出
+        if 全为零: return strip(c)
+        c = c - q * 1000 + cp.pad(q[:-1], (1, 0))   # 溢出整体挪高一位加回
+        if q 只剩 0/1: return strip(_carry_scan(c, +1))   # 残余进位：一次前缀扫描收尾（§10）</code></pre>
+        <p class="small">减法用对称的「借位」写法；比较大小 <code>cmp</code> 从最高位找第一个不同的 limb；「除以 2」有个漂亮的并行技巧：基 1000 是偶数，第 i 位的结果 =
+            <code>d[i]//2 + 500·(d[i+1] 的奇偶)</code>，所有 limb 一次算完、无需传播——牛顿迭代里会反复用到它。
+        </p>
+        <h2 id="c5">5. FFT 大整数乘法</h2>
+        <p><b>原理。</b>把大数看成「1000 进制多项式」，两数相乘＝系数做<b>卷积</b>。朴素卷积是 O(n²)——对 33 万 limb 要约 10<sup>11</sup>
+            次乘加，太慢。<b>卷积定理</b>给出近路：在「频域」里，卷积＝逐点相乘。于是 FFT 变到频域、逐点乘、逆 FFT 变回来，总代价降到 O(n log n)：</p>
+        <figure><svg viewBox="0 0 680 155" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="12.5">
+                <rect x="20" y="26" width="140" height="36" fill="#fdecec" stroke="#e6a6a6" /><text x="90" y="49"
+                    text-anchor="middle">两个系数数组</text>
+                <rect x="20" y="104" width="140" height="34" fill="#eefaf2" stroke="#8fd3ad" /><text x="90" y="126"
+                    text-anchor="middle">乘积系数</text>
+                <text x="90" y="86" text-anchor="middle" fill="#c07a3a" font-size="11">直接卷积 O(n²) ✗</text>
+                <rect x="270" y="10" width="150" height="32" fill="#eef4ff" stroke="#9db8f0" /><text x="345" y="31"
+                    text-anchor="middle">频域（各自）</text>
+                <rect x="270" y="120" width="150" height="30" fill="#eef4ff" stroke="#9db8f0" /><text x="345" y="140"
+                    text-anchor="middle">频域乘积</text>
+                <path d="M162 38 C 230 18,250 18,270 26" fill="none" stroke="#2c5f8f" stroke-width="2" /><text x="205"
+                    y="14" fill="#2c5f8f">① FFT</text>
+                <path d="M345 42 L345 120" stroke="#2c5f8f" stroke-width="2" /><text x="352" y="86" fill="#2c5f8f">② 逐点乘
+                    O(n)</text>
+                <path d="M270 135 C 220 140,200 135,162 125" fill="none" stroke="#2c5f8f" stroke-width="2" /><text
+                    x="195" y="152" fill="#2c5f8f">③ 逆 FFT</text>
+                <text x="470" y="80" fill="#1c7c3c" font-size="13">总 O(n log n) ✓</text>
+            </svg>
+            <figcaption>图 3：FFT 乘法——把难做的卷积变成好做的逐点相乘。</figcaption>
+        </figure>
+        <pre class="code"><code>def mul_fft(x, y):
+    m = nx + ny - 1
+    s = 2 的幂 ≥ m
+    xf = cp.fft.rfft(x.astype(cp.float64), n=s)      # ① 变到频域
+    yf = cp.fft.rfft(y.astype(cp.float64), n=s)
+    z = cp.fft.irfft(xf * yf, n=s)[:m]               # ② 逐点乘  ③ 变回来
+    zr = cp.rint(z)                                  # 四舍五入还原成整数
+    err = float(cp.abs(z - zr).max())
+    assert err &lt; 0.25, &quot;FFT rounding error too large&quot; # 安全阀：绝不悄悄算错
+    return normalize(zr.astype(cp.int64))</code></pre>
+        <p><b>浮点怎么算出精确整数？</b>FFT 内部用 float64，但 float64 能精确表示到 2<sup>53</sup> ≈ 9×10<sup>15</sup>，而卷积系数最大约 n·999² ≈
+            6.7×10<sup>11</sup>（n 取我们最大的乘法规模），还有<b>一万多倍</b>余量，四舍五入就能无误差还原。更关键的是那行<b>安全阀</b>：每次乘法都检查浮点结果离最近整数有多远，一旦超过
+            0.25 立即报错——绝不<b>悄悄</b>算错。本次两个实现全程的实测最大误差是 1.5×10⁻⁴ 与 2.1×10⁻⁴，离红线有三个数量级。</p>
+        <p class="small">很小的数字则用直接的「外积求和」小乘法（schoolbook），避免 FFT 的固定启动开销。</p>
+        <h2 id="c6">6. 牛顿迭代：只靠乘法做出除法与开方</h2>
+        <p>算 π 还需要除法和开方，但我们只想用已经造好的乘法。牛顿迭代做到了。求倒数 1/T：</p>
+        <div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML">
+                <msub>
+                    <mi>x</mi>
+                    <mrow>
+                        <mi>n</mi>
+                        <mo>+</mo>
+                        <mn>1</mn>
+                    </mrow>
+                </msub>
+                <mo>=</mo>
+                <msub>
+                    <mi>x</mi>
+                    <mi>n</mi>
+                </msub>
+                <mo>&#8290;</mo>
+                <mo>(</mo>
+                <mn>2</mn>
+                <mo>&#8722;</mo>
+                <mi>T</mi>
+                <mo>&#8901;</mo>
+                <msub>
+                    <mi>x</mi>
+                    <mi>n</mi>
+                </msub>
+                <mo>)</mo>
+            </math></div>
+        <p>求倒数平方根 1/√K（开方即 √K = K·(1/√K)）：</p>
+        <div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML">
+                <msub>
+                    <mi>y</mi>
+                    <mrow>
+                        <mi>n</mi>
+                        <mo>+</mo>
+                        <mn>1</mn>
+                    </mrow>
+                </msub>
+                <mo>=</mo>
+                <mfrac>
+                    <mrow>
+                        <msub>
+                            <mi>y</mi>
+                            <mi>n</mi>
+                        </msub>
+                        <mo>&#8290;</mo>
+                        <mo>(</mo>
+                        <mn>3</mn>
+                        <mo>&#8722;</mo>
+                        <mi>K</mi>
+                        <mo>&#8901;</mo>
+                        <msubsup>
+                            <mi>y</mi>
+                            <mi>n</mi>
+                            <mn>2</mn>
+                        </msubsup>
+                        <mo>)</mo>
+                    </mrow>
+                    <mn>2</mn>
+                </mfrac>
+            </math></div>
+        <p>两个迭代都只有乘法、减法和「除以 2」（上一节的并行取半），而且都<b>二次收敛</b>——每迭代一步，正确位数翻倍：15 → 30 → 60 → … → 1,000,000，从一个
+            <code>double</code> 种子出发约 17 步到位。在整数世界里，「1/√K」被表示成 <code>y ≈ B^(2h)/…</code> 这样的定点放大形式，「除以 B
+            的幂」恰好是把数组低位整段丢掉，精确且零成本。
+        </p>
+        <div class="callout">记住「每步位数翻倍」这个性质——第 9 节的两项优化（精度爬升、热启动）全部建立在它上面。</div>
+        <h2 id="c7">7. 选算法：收敛速度决定一切</h2>
+        <p>基础设施齐了，用什么公式算 π？</p>
+        <h3>7.1 级数路线：线性收敛</h3>
+        <div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML">
+                <mfrac>
+                    <mi>&#960;</mi>
+                    <mn>4</mn>
+                </mfrac>
+                <mo>=</mo>
+                <mn>1</mn>
+                <mo>&#8722;</mo>
+                <mfrac>
+                    <mn>1</mn>
+                    <mn>3</mn>
+                </mfrac>
+                <mo>+</mo>
+                <mfrac>
+                    <mn>1</mn>
+                    <mn>5</mn>
+                </mfrac>
+                <mo>&#8722;</mo>
+                <mfrac>
+                    <mn>1</mn>
+                    <mn>7</mn>
+                </mfrac>
+                <mo>+</mo>
+                <mo>&#8943;</mo>
+            </math></div>
+        <p>最出名的莱布尼茨级数优美，但 100 万项才换来 6～7
+            位——纯属反面教材。历史上出现过许多收敛快得多的级数（好的级数每项能贡献十几位），但级数有个共同的天花板：<b>正确位数与项数成正比</b>——这叫<b>线性收敛</b>。要 100
+            万位，就得老老实实合并几万到上百万个项，而且这些项的合并是海量的「小运算」，恰恰是 GPU 最不喜欢的负载形状（第 3 节的心法反过来说：零碎的小操作喂不饱上万个核心）。</p>
+        <h3>7.2 Gauss–Legendre：每轮位数翻倍</h3>
+        <p>Gauss–Legendre（Brent–Salamin，1976）不做级数求和，而是反复施加一组极简单的变换：</p>
+        <div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML">
+                <mrow>
+                    <msub>
+                        <mi>a</mi>
+                        <mn>0</mn>
+                    </msub>
+                    <mo>=</mo>
+                    <mn>1</mn>
+                    <mo>,</mo>
+                    <msub>
+                        <mi>b</mi>
+                        <mn>0</mn>
+                    </msub>
+                    <mo>=</mo>
+                    <mfrac>
+                        <mn>1</mn>
+                        <msqrt>
+                            <mn>2</mn>
+                        </msqrt>
+                    </mfrac>
+                    <mo>,</mo>
+                    <msub>
+                        <mi>t</mi>
+                        <mn>0</mn>
+                    </msub>
+                    <mo>=</mo>
+                    <mfrac>
+                        <mn>1</mn>
+                        <mn>4</mn>
+                    </mfrac>
+                    <mo>,</mo>
+                    <msub>
+                        <mi>p</mi>
+                        <mn>0</mn>
+                    </msub>
+                    <mo>=</mo>
+                    <mn>1</mn>
+                </mrow>
+            </math></div>
+        <div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML">
+                <mrow>
+                    <msub>
+                        <mi>a</mi>
+                        <mrow>
+                            <mi>n</mi>
+                            <mo>+</mo>
+                            <mn>1</mn>
+                        </mrow>
+                    </msub>
+                    <mo>=</mo>
+                    <mfrac>
+                        <mrow>
+                            <msub>
+                                <mi>a</mi>
+                                <mi>n</mi>
+                            </msub>
+                            <mo>+</mo>
+                            <msub>
+                                <mi>b</mi>
+                                <mi>n</mi>
+                            </msub>
+                        </mrow>
+                        <mn>2</mn>
+                    </mfrac>
+                    <mo>,&#x2003;</mo>
+                    <msub>
+                        <mi>b</mi>
+                        <mrow>
+                            <mi>n</mi>
+                            <mo>+</mo>
+                            <mn>1</mn>
+                        </mrow>
+                    </msub>
+                    <mo>=</mo>
+                    <msqrt>
+                        <mrow>
+                            <msub>
+                                <mi>a</mi>
+                                <mi>n</mi>
+                            </msub>
+                            <msub>
+                                <mi>b</mi>
+                                <mi>n</mi>
+                            </msub>
+                        </mrow>
+                    </msqrt>
+                    <mo>,&#x2003;</mo>
+                    <msub>
+                        <mi>t</mi>
+                        <mrow>
+                            <mi>n</mi>
+                            <mo>+</mo>
+                            <mn>1</mn>
+                        </mrow>
+                    </msub>
+                    <mo>=</mo>
+                    <msub>
+                        <mi>t</mi>
+                        <mi>n</mi>
+                    </msub>
+                    <mo>&#8722;</mo>
+                    <msub>
+                        <mi>p</mi>
+                        <mi>n</mi>
+                    </msub>
+                    <msup>
+                        <mrow>
+                            <mo>(</mo>
+                            <msub>
+                                <mi>a</mi>
+                                <mi>n</mi>
+                            </msub>
+                            <mo>&#8722;</mo>
+                            <msub>
+                                <mi>a</mi>
+                                <mrow>
+                                    <mi>n</mi>
+                                    <mo>+</mo>
+                                    <mn>1</mn>
+                                </mrow>
+                            </msub>
+                            <mo>)</mo>
+                        </mrow>
+                        <mn>2</mn>
+                    </msup>
+                    <mo>,&#x2003;</mo>
+                    <msub>
+                        <mi>p</mi>
+                        <mrow>
+                            <mi>n</mi>
+                            <mo>+</mo>
+                            <mn>1</mn>
+                        </mrow>
+                    </msub>
+                    <mo>=</mo>
+                    <mn>2</mn>
+                    <msub>
+                        <mi>p</mi>
+                        <mi>n</mi>
+                    </msub>
+                </mrow>
+            </math></div>
+        <div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML">
+                <mrow>
+                    <mi>&#960;</mi>
+                    <mo>&#8776;</mo>
+                    <mfrac>
+                        <msup>
+                            <mrow>
+                                <mo>(</mo>
+                                <msub>
+                                    <mi>a</mi>
+                                    <mi>n</mi>
+                                </msub>
+                                <mo>+</mo>
+                                <msub>
+                                    <mi>b</mi>
+                                    <mi>n</mi>
+                                </msub>
+                                <mo>)</mo>
+                            </mrow>
+                            <mn>2</mn>
+                        </msup>
+                        <mrow>
+                            <mn>4</mn>
+                            <msub>
+                                <mi>t</mi>
+                                <mi>n</mi>
+                            </msub>
+                        </mrow>
+                    </mfrac>
+                </mrow>
+            </math></div>
+        <p>a 和 b 一个取<b>算术平均</b>、一个取<b>几何平均</b>，两者会以惊人的速度彼此靠近（这个共同极限叫「算术几何平均数」AGM）。关键性质是<b>二次收敛</b>：a 与 b
+            一致的位数<b>每轮翻一倍</b>——和牛顿迭代同款。这不是理论上的漂亮话，下面是实测——第 n 轮结束后 a、b 一致的十进制位数：</p>
+        <figure><svg viewBox="0 0 800 275" role="img"><text x="400" y="20" font-size="14" text-anchor="middle"
+                    fill="#222">每轮迭代后 a、b 一致的十进制位数（实测，对数刻度）——每轮翻倍，19 轮破百万</text>
+                <line x1="55" y1="40" x2="55" y2="240" stroke="#999" />
+                <line x1="55" y1="240" x2="790" y2="240" stroke="#999" /><text x="48" y="244" font-size="11"
+                    text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">0</tspan></text>
+                <line x1="52" y1="240" x2="58" y2="240" stroke="#999" /><text x="48" y="211" font-size="11"
+                    text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">1</tspan></text>
+                <line x1="52" y1="207" x2="58" y2="207" stroke="#999" /><text x="48" y="178" font-size="11"
+                    text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">2</tspan></text>
+                <line x1="52" y1="174" x2="58" y2="174" stroke="#999" /><text x="48" y="145" font-size="11"
+                    text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">3</tspan></text>
+                <line x1="52" y1="141" x2="58" y2="141" stroke="#999" /><text x="48" y="112" font-size="11"
+                    text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">4</tspan></text>
+                <line x1="52" y1="108" x2="58" y2="108" stroke="#999" /><text x="48" y="79" font-size="11"
+                    text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">5</tspan></text>
+                <line x1="52" y1="75" x2="58" y2="75" stroke="#999" /><text x="48" y="46" font-size="11"
+                    text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">6</tspan></text>
+                <line x1="52" y1="42" x2="58" y2="42" stroke="#999" />
+                <rect x="60" y="240" width="30" height="0" fill="#4c7fbe" />
+                <rect x="98" y="240" width="30" height="0" fill="#4c7fbe" />
+                <rect x="136" y="224" width="30" height="16" fill="#4c7fbe" /><text x="151" y="258" font-size="11"
+                    text-anchor="middle" fill="#555">3</text>
+                <rect x="174" y="208" width="30" height="32" fill="#4c7fbe" />
+                <rect x="212" y="198" width="30" height="42" fill="#4c7fbe" />
+                <rect x="250" y="186" width="30" height="54" fill="#4c7fbe" /><text x="265" y="258" font-size="11"
+                    text-anchor="middle" fill="#555">6</text>
+                <rect x="288" y="176" width="30" height="64" fill="#4c7fbe" />
+                <rect x="326" y="166" width="30" height="74" fill="#4c7fbe" />
+                <rect x="364" y="155" width="30" height="85" fill="#4c7fbe" /><text x="379" y="258" font-size="11"
+                    text-anchor="middle" fill="#555">9</text>
+                <rect x="402" y="145" width="30" height="95" fill="#4c7fbe" />
+                <rect x="440" y="135" width="30" height="105" fill="#4c7fbe" /><text x="455" y="131" font-size="10"
+                    text-anchor="middle" fill="#333">1.4k</text>
+                <rect x="478" y="125" width="30" height="115" fill="#4c7fbe" /><text x="493" y="258" font-size="11"
+                    text-anchor="middle" fill="#555">12</text><text x="493" y="121" font-size="10" text-anchor="middle"
+                    fill="#333">2.8k</text>
+                <rect x="516" y="115" width="30" height="125" fill="#4c7fbe" /><text x="531" y="111" font-size="10"
+                    text-anchor="middle" fill="#333">5.6k</text>
+                <rect x="554" y="105" width="30" height="135" fill="#4c7fbe" /><text x="569" y="101" font-size="10"
+                    text-anchor="middle" fill="#333">11k</text>
+                <rect x="592" y="95" width="30" height="145" fill="#4c7fbe" /><text x="607" y="258" font-size="11"
+                    text-anchor="middle" fill="#555">15</text><text x="607" y="91" font-size="10" text-anchor="middle"
+                    fill="#333">22k</text>
+                <rect x="630" y="85" width="30" height="155" fill="#4c7fbe" /><text x="645" y="81" font-size="10"
+                    text-anchor="middle" fill="#333">44k</text>
+                <rect x="668" y="75" width="30" height="165" fill="#4c7fbe" /><text x="683" y="71" font-size="10"
+                    text-anchor="middle" fill="#333">89k</text>
+                <rect x="706" y="65" width="30" height="175" fill="#4c7fbe" /><text x="721" y="258" font-size="11"
+                    text-anchor="middle" fill="#555">18</text><text x="721" y="61" font-size="10" text-anchor="middle"
+                    fill="#333">178k</text>
+                <rect x="744" y="55" width="30" height="185" fill="#4c7fbe" /><text x="759" y="258" font-size="11"
+                    text-anchor="middle" fill="#555">19</text><text x="759" y="51" font-size="10" text-anchor="middle"
+                    fill="#333">357k</text><text x="420" y="272" font-size="12" text-anchor="middle"
+                    fill="#555">迭代轮数</text>
+            </svg>
+            <figcaption>图 4：实测的一致位数（0, 0, 3, 9, 18, 42, …, 357,660）。从第 3 轮起每轮几乎精确翻倍；再翻一倍就越过 100 万，所以 <b>19 轮</b>就够了。
+            </figcaption>
+        </figure>
+        <p>100 万位只要 19 轮，而且每一轮都是「整片数组」级别的大运算——正是 GPU 喜欢的负载形状。但天下没有免费的午餐：级数路线几乎只用乘加，而 Gauss–Legendre <b>每一轮都要在 100
+                万位的精度上开一次平方根</b>（b′ = √(ab)），最后还要做一次同样精度的除法。这个算法能不能跑得快，完全取决于两件事：大数乘法有多快，以及牛顿迭代做得聪明不聪明。</p>
+        <div class="callout">终止判据直接来自二次收敛：设已一致 g 位，下一轮就会一致约 2g 位。当 2g ≥ p + 30（p 是工作精度）时，直接用当前的 a、b、t 出 π
+            即可，误差压在保护位以下。主循环里就一行：<code>if 2 * agree &gt;= p + 30: break</code>。</div>
+        <h2 id="c8">8. 定点缩放：让实数进整数库</h2>
+        <p>Gauss–Legendre 的变量是<b>实数</b>（1/√2 = 0.7071…），而我们的库只有非负大整数。办法是<b>定点缩放</b>：所有量一律乘上 10<sup>p</sup> 存成整数，p =
+            1,000,050（100 万位 + 50 位保护位，且是 3 的倍数，恰好 333,350 个 limb）。于是每个实数运算都严格对应一个整数运算：</p>
+        <table>
+            <tr>
+                <th>实数世界</th>
+                <th>定点整数世界（一切 ×10<sup>p</sup>）</th>
+                <th>用到的原语</th>
+            </tr>
+            <tr>
+                <td>(a+b)/2</td>
+                <td>(A+B)/2</td>
+                <td>加法 + 偶基取半（无进位传播）</td>
+            </tr>
+            <tr>
+                <td>√(a·b)</td>
+                <td>isqrt(A·B)：A·B 带 10<sup>2p</sup>，开方后恰好回到 10<sup>p</sup></td>
+                <td>乘法 + 牛顿开方</td>
+            </tr>
+            <tr>
+                <td>t − p·(a−a′)²</td>
+                <td>T − pₙ·(D² 右移 p 位)</td>
+                <td>乘法 + 移位（丢低位=截断）</td>
+            </tr>
+            <tr>
+                <td>(a+b)²/(4t)</td>
+                <td>(A+B)²·recip(4T) 再右移</td>
+                <td>乘法 + 牛顿倒数</td>
+            </tr>
+        </table>
+        <p>截断带来的误差每轮不超过几个「最后一位」，乘上 pₙ ≤ 2<sup>18</sup> 也只污染最低六七位，19 轮累计远小于 50 位保护位——这一点在 300 / 3 万 / 30
+            万位规模上都与基准逐位比对过。基是 10³ 也让「乘除 10 的幂」都变成整段移 limb，精确且零成本。</p>
+        <h2 id="c9">9. 牛顿迭代的两件武器：精度爬升与热启动</h2>
+        <p>第 6 节的牛顿开方如果只算一次，怎么写都行；但 Gauss–Legendre 每轮都来，<b>共 20 次</b>。如果每一步牛顿都在全精度上做乘法，一次开方要做约 19 步全尺寸大乘法，20 次开方就是约 400
+            步——足以吞掉换算法省下的一切。这里需要两个标准武器：</p>
+        <h3>9.1 精度爬升（ramping）</h3>
+        <p>牛顿第 k 步只有约 2<sup>k</sup> 位是正确的——那就别在全精度上白算！把精度分成层级（每层 limb 数翻倍），低层用几十位的 Python 整数精确播种，然后逐层上爬：每层只取 K 的最高 m 个
+            limb 参与运算，做一步牛顿恰好把正确位数从「半层」推到「全层」。因为每层运算量是上一层的两倍，总代价 ≈ 最后一层的 2 倍——<b>一次开方 ≈ 常数次全尺寸乘法</b>。</p>
+        <h3>9.2 热启动（warm start）</h3>
+        <p>相邻两轮的 K = aₙbₙ 高位几乎一样（第 n 轮已一致 ~2ⁿ 位）。而牛顿迭代的中间量 y ≈ 1/√K 我们本来就留着——把上一轮的 y
+            直接当种子，就能跳过大部分爬升层级，从「已知一半位数正确」的高层直接进入。最后一层照例迭代到「修正量为零」，天然自我纠错：就算热启动的估计过于乐观，也只是多做一两步，不会算错。</p>
+        <pre class="code"><code>def rsqrt_ramp(bg, K, warm=None, warm_digits=0):
+    # y ≈ B^(dk+2)/√K 的牛顿迭代：精度逐层翻倍，只在最后一两层为全精度
+    levels = _levels(dk, parity_anchor=dk)     # 例如 [11, 21, 41, ..., 333350, 666700]
+    if warm is not None and warm_digits &gt;= 36:
+        start = 满足「层级 ≤ 2×可信 limb 数」的最大层级    # 热启动：直接跳进高层
+        y = bg.shr_limbs(warm, (dk - levels[start]) // 2)  # 上一轮的 y 降尺度作种子
+    else:
+        y = 用 Python 整数在最低层级精确播种（十几位）
+
+    for m in levels[start:]:
+        Km  = bg.shr_limbs(K, dk - m)          # 只取 K 的最高 m 个 limb ——「工作精度」
+        # 牛顿步：y ← y + y·(B^{2h} − K·y²)/2B^{2h}；中间层一步够，最后一层迭代到修正量为 0
+        Ky2   = bg.mul(Km, bg.mul(y, y))
+        rr    = |B^{2h} − Ky2|
+        delta = bg.half(bg.shr_limbs(bg.mul(y, rr), 2 * h))
+        y     = y ± delta
+    return bg.shr_limbs(bg.mul(K, y), h), y    # √K = K·(1/√K)；y 留给下一轮热启动</code></pre>
+        <p>效果可以在实测的每轮耗时里直接看到（CuPy 实现）：前 14 轮 a、b 一致位数还少，每轮 ≈ 1 秒；从第 15 轮起（一致 2 万+ 位）热启动直接跳进最高层，每轮骤降到 0.05~0.09 秒：</p>
+        <table>
+            <tr>
+                <th>轮次</th>
+                <td class="num">1</td>
+                <td class="num">2</td>
+                <td class="num">3</td>
+                <td class="num">4</td>
+                <td class="num">5</td>
+                <td class="num">6</td>
+                <td class="num">7</td>
+                <td class="num">8</td>
+                <td class="num">9</td>
+                <td class="num">10</td>
+                <td class="num">11</td>
+                <td class="num">12</td>
+                <td class="num">13</td>
+                <td class="num">14</td>
+                <td class="num">15</td>
+                <td class="num">16</td>
+                <td class="num">17</td>
+                <td class="num">18</td>
+                <td class="num">19</td>
+            </tr>
+            <tr>
+                <th>CuPy 耗时(s)</th>
+                <td class="num">1.02</td>
+                <td class="num">1.04</td>
+                <td class="num">1.03</td>
+                <td class="num">1.07</td>
+                <td class="num">1.05</td>
+                <td class="num">1.06</td>
+                <td class="num">1.03</td>
+                <td class="num">1.02</td>
+                <td class="num">1.01</td>
+                <td class="num">0.97</td>
+                <td class="num">0.93</td>
+                <td class="num">0.92</td>
+                <td class="num">0.89</td>
+                <td class="num">0.79</td>
+                <td class="num">0.09</td>
+                <td class="num">0.08</td>
+                <td class="num">0.07</td>
+                <td class="num">0.06</td>
+                <td class="num">0.05</td>
+            </tr>
+            <tr>
+                <th>CUDA 耗时(s)</th>
+                <td class="num">0.041</td>
+                <td class="num">0.045</td>
+                <td class="num">0.045</td>
+                <td class="num">0.045</td>
+                <td class="num">0.045</td>
+                <td class="num">0.045</td>
+                <td class="num">0.043</td>
+                <td class="num">0.043</td>
+                <td class="num">0.043</td>
+                <td class="num">0.042</td>
+                <td class="num">0.042</td>
+                <td class="num">0.041</td>
+                <td class="num">0.041</td>
+                <td class="num">0.040</td>
+                <td class="num">0.039</td>
+                <td class="num">0.038</td>
+                <td class="num">0.037</td>
+                <td class="num">0.036</td>
+                <td class="num">0.034</td>
+            </tr>
+        </table>
+        <p class="small">CUDA C++ 版每轮几乎恒定 0.04s——它的开销主要是数据搬运而非启动延迟，第 13 节细说。整个 100 万位计算两个实现分别只做了 273 / 290
+            步牛顿（含所有层级），其中全尺寸的只有几十步。</p>
+        <h2 id="c10">10. 一条性能暗礁：999…9 进位长链</h2>
+        <p>这是本项目调优过程中最有戏剧性的一幕，值得单独一节。第一版程序算出了完全正确的 100 万位，但 CuPy 版花了 86.7 秒，其中「最后一次除法」独占 71.4 秒——一次除法比 19
+            轮迭代加起来还慢好几倍，明显不对劲。逐层计时定位后，罪魁祸首令人意外：<b>进位</b>。</p>
+        <p>第 4 节的「多趟传播」对随机数据 3~5 趟就干净了。但牛顿迭代天天制造一种特殊的数：T·w ≈ B<sup>g</sup>，也就是<b>1 后面跟着几十万个 0</b>（或差一点时的
+            99999…）。这种数在卷积系数归一化时，一个 +1 的进位要<b>穿过整条 0/9 长链</b>，而「多趟传播」每趟只能把它送过一格——于是一次乘法的进位要传 166,679 趟：</p>
+        <pre class="code"><code>level 333351: mul=34.876s (166679 趟进位!)   ← 修复前的实测（CuPy，单次乘法）</code></pre>
+        <p>这正是硬件加法器里的经典问题（行波进位 vs 超前进位），解法也是同一个：<b>进位前瞻</b>。先用两三趟有界传播把每个 limb 压到只剩 0/±1 的残余进位，然后观察：进位链只会「穿过」999（或借位链穿过
+            000），在其他任何数字上都会被吸收。于是「位置 i 会不会收到进位」＝「i 下方最近的非 999 位置是否点火」——这是一个<b>前缀扫描</b>（prefix scan），一次算完所有位置，链再长也一趟到底：
+        </p>
+        <pre class="code"><code># 串行进位（一次只能走一格）              # 并行前缀版（一次扫描走到底）
+carry = 0                                 def _carry_scan(s, sign):        # s 的残余进位 ∈ {0,1}
+for i in range(n):                            prop = (s == 999)            # 999：进位会「穿过」它
+    v = s[i] + carry                          gen  = (s &gt;= 1000)           # 这里必然产生进位
+    s[i] = v % 1000                           last = 前缀扫描: i 以下最近的非 999 位置
+    carry = v // 1000                         carry_in[i] = gen[last[i-1]] # 链头是否点火，一步查到
+                                              return (s + carry_in) % 1000</code></pre>
+        <p>CuPy 里用 <code>cumsum</code> + 一次花式索引实现这个前缀扫描；CUDA C++ 里用教科书式的Kogge–Stone (generate, propagate) 扫描（log₂n ≈ 21
+            趟布尔操作，顺带把所有 host 同步都省了）。修复后：</p>
+        <table>
+            <tr>
+                <th>CuPy 版（100 万位）</th>
+                <th class="num">修复前</th>
+                <th class="num">修复后</th>
+                <th class="num">加速</th>
+            </tr>
+            <tr>
+                <td>端到端</td>
+                <td class="num">86.7 s</td>
+                <td class="num">16.7 s</td>
+                <td class="num">5.2×</td>
+            </tr>
+            <tr>
+                <td>其中：最后一次除法</td>
+                <td class="num">71.4 s</td>
+                <td class="num">0.9 s</td>
+                <td class="num">79×</td>
+            </tr>
+        </table>
+        <div class="callout warn">教训：向量化的「平均情况」性能可能藏着 O(n) 的最坏情况，而数值算法（牛顿迭代）恰恰会系统性地制造最坏情况输入。纯整数的级数求和很少产生 B<sup>g</sup>
+            附近的数，多趟传播够用；而 Gauss–Legendre 的牛顿迭代每一步都在制造这种数——快算法把压力转移给了基础设施。</div>
+        <h2 id="c11">11. 实现 1：CuPy —— 数组级的 GPU 大数库</h2>
+        <p>实现 1 分成两层：主程序 <code>gauss_legendre.py</code> 承载算法（AGM
+            主循环、牛顿爬升、终止判据），它只调用大数库暴露的原语（<code>add / sub / mul / half / shl / shr / cmp / isqrt…</code>）；大数库
+            <code>bignum_cupy.py</code> 把每个原语写成对整条 limb 数组的运算（第 4–6 节的全部代码就取自它）——数组常驻显存，每个数组操作由 CuPy 发射成 CUDA kernel，FFT
+            则走 NVIDIA 的 cuFFT 库。算法层完全不知道自己跑在 GPU 上，这也为第 12 节的 CUDA C++ 版立好了「行为规范」：同一串大数运算（791 次 FFT 乘法、273
+            步牛顿），逐位一致的输出互为对拍。
+        </p>
+        <pre class="code"><code>while True:                                    # Gauss–Legendre 主循环（gauss_legendre.py，节选）
+    c = bg.cmp(A, Bv)
+    diff = bg.sub(A, Bv) if c &gt; 0 else bg.sub(Bv, A)
+    agree = 3 * (Lp - len(strip(diff)))        # a、b 已一致的十进制位数
+    if 2 * agree &gt;= p + 30:                    # 一致位数再翻一倍就超过 p → 可以出结果了
+        break
+    A2 = bg.half(bg.add(A, Bv))                # a&#x27; = (a+b)/2
+    d  = bg.sub(A, A2)                         # a − a&#x27;（高位全零，自动变短）
+    T  = bg.sub(T, bg.mul_scalar(bg.shr_limbs(bg.mul(d, d), Lp), pn))
+    K  = bg.mul(A, Bv)                         # a·b
+    Bv, y = rsqrt_ramp(bg, K, warm=y, warm_digits=agree - 9)   # b&#x27; = sqrt(ab)，热启动
+    A = A2; pn *= 2
+
+S  = bg.add(A, Bv)                             # 收尾：π·10^p = (a+b)²/(4t)
+PI = bg.shr_limbs(bg.mul(bg.mul(S, S), recip_ramp(bg, bg.mul_scalar(T, 4), g)), g)</code></pre>
+        <h2 id="c12">12. 实现 2：自己搭一个百万点 FFT</h2>
+        <h3>12.1 规则与动机</h3>
+        <p>实现 1 里 GPU 的 FFT 由 cuFFT 完成——那是 NVIDIA 的闭源库，一个函数调用进去就是黑盒。实现 2 给自己立的规矩是：<b>不用任何主机端数学库</b>（不用 cuFFT、不用
+            cuBLAS），只允许两个 header-only 的「设备端积木」：<b>cuFFTDx</b> 和 <b>cuBLASDx</b>（NVIDIA MathDx 25.6）。它们的定位很特别：不是「替你做完一个
+            FFT」，而是给你的 CUDA kernel 里嵌入一段「单个线程块内的小 FFT / 小矩阵乘」，数据必须已经在你自己管理的共享内存或寄存器里。换句话说：<b>百万点的大 FFT 得自己拆、自己拼。</b></p>
+        <div class="callout">给没写过 CUDA 的读者的最小背景：GPU 程序由成千上万个<b>线程</b>执行，线程按<b>线程块</b>（这里是 256
+            线程）分组；同一块内的线程可以通过一小块超快的<b>共享内存</b>（这里 80KB）协作，块与块之间只能通过显存见面。cuFFTDx 能做的最大 fp64 FFT
+            就是「一个块的共享内存装得下」的规模（几千点），而我们需要 2<sup>20</sup>~2<sup>22</sup> 点。</div>
+        <h3>12.2 四步法：大 FFT = 转置 + 两轮小 FFT</h3>
+        <p>把长度 N = P·Q 的数组看成 P×Q 的矩阵（n = Q·i + j），DFT 的求和可以精确地拆成：</p>
+        <div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML">
+                <mrow>
+                    <mi>X</mi>
+                    <mo>[</mo>
+                    <msub>
+                        <mi>k</mi>
+                        <mi>i</mi>
+                    </msub>
+                    <mo>+</mo>
+                    <mi>P</mi>
+                    <msub>
+                        <mi>k</mi>
+                        <mi>j</mi>
+                    </msub>
+                    <mo>]</mo>
+                    <mo>=</mo>
+                    <munder>
+                        <mo>&#8721;</mo>
+                        <mi>j</mi>
+                    </munder>
+                    <msubsup>
+                        <mi>W</mi>
+                        <mi>Q</mi>
+                        <mrow>
+                            <mi>j</mi>
+                            <msub>
+                                <mi>k</mi>
+                                <mi>j</mi>
+                            </msub>
+                        </mrow>
+                    </msubsup>
+                    <mo>&#8901;</mo>
+                    <msubsup>
+                        <mi>W</mi>
+                        <mi>N</mi>
+                        <mrow>
+                            <mi>j</mi>
+                            <msub>
+                                <mi>k</mi>
+                                <mi>i</mi>
+                            </msub>
+                        </mrow>
+                    </msubsup>
+                    <mo>&#8901;</mo>
+                    <mrow>
+                        <mo>(</mo>
+                        <munder>
+                            <mo>&#8721;</mo>
+                            <mi>i</mi>
+                        </munder>
+                        <mi>x</mi>
+                        <mo>[</mo>
+                        <mi>Q</mi>
+                        <mi>i</mi>
+                        <mo>+</mo>
+                        <mi>j</mi>
+                        <mo>]</mo>
+                        <msubsup>
+                            <mi>W</mi>
+                            <mi>P</mi>
+                            <mrow>
+                                <mi>i</mi>
+                                <msub>
+                                    <mi>k</mi>
+                                    <mi>i</mi>
+                                </msub>
+                            </mrow>
+                        </msubsup>
+                        <mo>)</mo>
+                    </mrow>
+                </mrow>
+            </math></div>
+        <p>读法：先沿 i 方向做 Q 个 <b>P 点 FFT</b>（内层求和），乘上「跨行相位」W<sub>N</sub><sup>j·k_i</sup>（twiddle 因子），再沿 j 方向做 P 个 <b>Q 点
+                FFT</b>（外层求和）。中间夹两次矩阵转置，让每轮小 FFT 的数据在内存里连续：</p>
+        <figure><svg viewBox="0 0 860 250" role="img">
+                <defs>
+                    <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+                        <path d="M0,0 L7,3 L0,6 z" fill="#666" />
+                    </marker>
+                </defs><text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">四步法：把 N=P·Q 点的大 FFT
+                    拆成两轮「每行一个小 FFT」+ 两次转置</text>
+                <rect x="20" y="60" width="130" height="130" rx="6" fill="#eef3fa" stroke="#666" /><text x="85" y="75"
+                    font-size="12" text-anchor="middle" fill="#222">输入（自然序）</text><text x="85" y="125" font-size="12"
+                    text-anchor="middle" fill="#222">P×Q 矩阵</text><text x="85" y="145" font-size="11"
+                    text-anchor="middle" fill="#222">n = Q·i + j</text>
+                <line x1="152" y1="125" x2="195" y2="125" stroke="#666" marker-end="url(#ah)" /><text x="173" y="112"
+                    font-size="11" text-anchor="middle" fill="#222">转置</text>
+                <rect x="197" y="60" width="160" height="130" rx="6" fill="#eaf6ec" stroke="#666" /><text x="277" y="75"
+                    font-size="12" text-anchor="middle" fill="#222">kernel B（每行一块）</text><text x="277" y="125"
+                    font-size="12" text-anchor="middle" fill="#222">Q 行 × 2048 点 FFT</text><text x="277" y="145"
+                    font-size="11" text-anchor="middle" fill="#222">cuBLASDx + cuFFTDx</text><text x="277" y="165"
+                    font-size="11" text-anchor="middle" fill="#222">＋外 twiddle</text>
+                <line x1="359" y1="125" x2="402" y2="125" stroke="#666" marker-end="url(#ah)" /><text x="380" y="112"
+                    font-size="11" text-anchor="middle" fill="#222">转置</text>
+                <rect x="404" y="60" width="150" height="130" rx="6" fill="#eef3fa" stroke="#666" /><text x="479" y="75"
+                    font-size="12" text-anchor="middle" fill="#222">kernel D</text><text x="479" y="125" font-size="12"
+                    text-anchor="middle" fill="#222">2048 行 × Q 点 FFT</text><text x="479" y="145" font-size="11"
+                    text-anchor="middle" fill="#222">cuFFTDx</text>
+                <line x1="556" y1="125" x2="599" y2="125" stroke="#666" marker-end="url(#ah)" />
+                <rect x="601" y="60" width="130" height="130" rx="6" fill="#faf0e6" stroke="#666" /><text x="666" y="75"
+                    font-size="12" text-anchor="middle" fill="#222">频谱（置乱序 σ）</text><text x="666" y="125" font-size="12"
+                    text-anchor="middle" fill="#222">点乘不看顺序</text><text x="666" y="145" font-size="11"
+                    text-anchor="middle" fill="#222">从不重排！</text><text x="430" y="225" font-size="12"
+                    text-anchor="middle" fill="#222">逆变换 = 完全镜像（D′ → 转置 → B′ → 转置），置乱序在正逆之间自然抵消</text>
+            </svg>
+            <figcaption>图 5：四步法数据流。P 固定为 2048，Q = N/2048 ∈ {4…2048}，覆盖 N = 2¹³…2²²。</figcaption>
+        </figure>
+        <p>一个省了大功夫的细节：kernel B 输出的频率顺序天然是「置乱」的（数位反转的混合序）。教科书做法是再加一趟重排恢复自然序，但我们的 FFT
+            只服务于卷积——正变换后马上点乘、马上逆变换。只要正逆变换使用<b>同一套置乱序</b>，点乘逐元素对齐即可，顺序根本无所谓。于是重排一趟都不用做，逆变换就是正变换的严格镜像。</p>
+        <h3>12.3 kernel B：DFT 就是矩阵乘 —— cuBLASDx 的用武之地</h3>
+        <p>每行 2048 点的 FFT 在一个线程块内完成，而 2048 = 32 × 64 还可以再拆一层。看 DFT 的定义：32 点 DFT 就是「32×32 的常数矩阵 F₃₂（元素
+            W₃₂<sup>g·k</sup>）乘一个向量」。把一行数据重排成 32×64 的矩阵后，「对 64 列各做一次 32 点 DFT」恰好是一个<b>复数矩阵乘</b> C = F₃₂ · X ——这正是
+            cuBLASDx 的地盘，而且 H100 的 FP64 <b>tensor core</b>（矩阵乘专用硬件单元）会自动接管。剩下的 64 点 FFT 交给 cuFFTDx。同一份数学，两种视角：<b>「FFT
+                是稀疏分解的矩阵乘，矩阵乘是展开了的 DFT」</b>。</p>
+        <figure><svg viewBox="0 0 860 240" role="img">
+                <defs>
+                    <marker id="ah2" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+                        <path d="M0,0 L7,3 L0,6 z" fill="#666" />
+                    </marker>
+                </defs><text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">kernel B 内部：2048 点 FFT = 32
+                    点 DFT（矩阵乘）× 64 点 FFT</text>
+                <rect x="20" y="55" width="150" height="120" rx="6" fill="#eef3fa" stroke="#666" /><text x="95" y="72"
+                    font-size="12" text-anchor="middle" fill="#222">一行 2048 个复数</text><text x="95" y="115"
+                    font-size="12" text-anchor="middle" fill="#222">重排成 32×64</text><text x="95" y="135" font-size="11"
+                    text-anchor="middle" fill="#222">i = s + 64·g</text>
+                <line x1="172" y1="115" x2="215" y2="115" stroke="#666" marker-end="url(#ah2)" />
+                <rect x="217" y="55" width="200" height="120" rx="6" fill="#fdeeee" stroke="#666" /><text x="317" y="72"
+                    font-size="12" text-anchor="middle" fill="#222">cuBLASDx：C = F₃₂ · X</text><text x="317" y="100"
+                    font-size="11" text-anchor="middle" fill="#222">F₃₂ 是 32×32 DFT 矩阵</text><text x="317" y="120"
+                    font-size="11" text-anchor="middle" fill="#222">complex&lt;double&gt; GEMM</text><text x="317"
+                    y="140" font-size="11" text-anchor="middle" fill="#222">FP64 tensor core (MMA)</text>
+                <line x1="419" y1="115" x2="462" y2="115" stroke="#666" marker-end="url(#ah2)" /><text x="440" y="102"
+                    font-size="11" text-anchor="middle" fill="#222">twiddle</text>
+                <rect x="464" y="55" width="190" height="120" rx="6" fill="#eaf6ec" stroke="#666" /><text x="559" y="72"
+                    font-size="12" text-anchor="middle" fill="#222">cuFFTDx：32 批</text><text x="559" y="105"
+                    font-size="12" text-anchor="middle" fill="#222">64 点 FFT</text><text x="559" y="130" font-size="11"
+                    text-anchor="middle" fill="#222">寄存器 API，块内共享内存</text>
+                <line x1="656" y1="115" x2="699" y2="115" stroke="#666" marker-end="url(#ah2)" />
+                <rect x="701" y="55" width="140" height="120" rx="6" fill="#faf0e6" stroke="#666" /><text x="771" y="72"
+                    font-size="12" text-anchor="middle" fill="#222">输出（存储序）</text><text x="771" y="110" font-size="12"
+                    text-anchor="middle" fill="#222">pos = 64·k_g + k_s</text><text x="771" y="133" font-size="11"
+                    text-anchor="middle" fill="#222">真频率 k_g + 32·k_s</text><text x="430" y="210" font-size="12"
+                    text-anchor="middle" fill="#222">全部发生在一个线程块（256 线程、80KB 共享内存）内，一次全局内存往返</text>
+            </svg>
+            <figcaption>图 6：kernel B 内部。GEMM（cuBLASDx）与 FFT（cuFFTDx）共处一个 kernel、共享一块共享内存，线程块形状 (8,32,1) 由 cuFFTDx
+                决定、cuBLASDx 适配。</figcaption>
+        </figure>
+        <pre class="code"><code>using FFT64 = decltype(cufftdx::Block() + cufftdx::Size&lt;64&gt;() + cufftdx::Type&lt;fft_type::c2c&gt;()
+            + cufftdx::Precision&lt;double&gt;() + cufftdx::ElementsPerThread&lt;8&gt;()
+            + cufftdx::FFTsPerBlock&lt;32&gt;() + cufftdx::SM&lt;900&gt;() + ...);   // 32 批 64 点 FFT/块
+
+using GEMM32 = decltype(cublasdx::Size&lt;32, 64, 32&gt;()                     // C(32×64) = A(32×32)·B(32×64)
+             + cublasdx::Precision&lt;double&gt;() + cublasdx::Type&lt;type::complex&gt;()
+             + cublasdx::Arrangement&lt;row_major, row_major, row_major&gt;()
+             + cublasdx::BlockDim&lt;FFT64::block_dim.x, FFT64::block_dim.y, 1&gt;()  // 与 FFT 同块形!
+             + cublasdx::SM&lt;900&gt;() + cublasdx::Block());</code></pre>
+        <pre class="code"><code>template&lt;bool INV&gt; __global__ void k_stageB(cplx* data, const cplx* fmat, long N) {
+    extern __shared__ char smem[];
+    dxcplx* row = ... + blockIdx.x * 2048;                     // 本块负责第 j 行
+    auto [sa, sb, sc] = cublasdx::slice_shared_memory&lt;GEMM32&gt;(smem);
+    // ① G 级：radix-32 DFT 写成矩阵乘 —— C[k_g][s] = Σ_g F32[k_g][g] · row[s+64g]
+    cublasdx::copy&lt;GEMM32, ...&gt;(F32_global, a_s);              // DFT 矩阵入共享内存
+    cublasdx::copy&lt;GEMM32, ...&gt;(row_global, b_s);              // 行数据入共享内存
+    GEMM32().execute(dxcplx{1,0}, a_s, b_s, dxcplx{0,0}, c_s); // FP64 tensor core
+    __syncthreads();
+    // ② 内 twiddle + ③ S 级：32 批 64 点 FFT（寄存器 API）
+    for (i...) rd[i] = cmul(c_s(kg, s), twiddle(-1, s * kg, 1.0/1024));
+    __syncthreads();
+    FFT64().execute(rd, smem);
+    // ④ 外 twiddle（四步法的跨行相位）+ 按存储序写回：pos = 64·k_g + k_s
+    for (i...) row[kg*64 + ks] = cmul(rd[i], twiddle(-1, j * (kg + 32L*ks), 2.0/N));
+}</code></pre>
+        <p>精度上有一个必须较真的细节：twiddle 因子 e<sup>−2πi·u/D</sup> 的辐角。我们所有的 D 都是 2 的幂，u/D 在二进制浮点里<b>精确可表示</b>，配合 CUDA 的
+            <code>sincospi</code>（自带精确的 π 参数归约）可以做到每个 twiddle ≤1 ulp 误差——不查表、不累积、现场算：
+        </p>
+        <pre class="code"><code>// e^{±2πi·u/D}，D 是 2 的幂 → u/D 在二进制里是精确值，sincospi 误差 ≤1 ulp
+__device__ dxcplx twiddle(double sign2, long num, double inv_den) {
+    double s, c;
+    sincospi(sign2 * (double)num * inv_den, &amp;s, &amp;c);
+    return dxcplx{c, s};
+}</code></pre>
+        <p>32 点 DFT 用「朴素矩阵乘」代替 5 层蝶形，每个输出多累加约 32 项浮点和，误差相当于多两三层蝶形——实测整个 100 万位计算的 FFT 最大舍入误差从纯 cuFFTDx 路径的 1.2×10⁻⁴ 升到
+            2.1×10⁻⁴，仍比 0.25 的红线低三个数量级。</p>
+        <h3>12.4 其余零件</h3>
+        <p>FFT 之外全是常规 CUDA 工程：装载（limb→复数）、点乘（顺带除 N）、取整+误差归约（0.25 红线每次乘法必查）、Kogge–Stone 进位前瞻（第 10 节）、转置（32×33
+            共享内存瓦片）、schoolbook 小乘法（两数乘积 ≤ 1600 万时直接平方级算法反而更快）、以及一个一次 <code>cudaMalloc</code> 的 8GB 显存池（指针递增分配 +
+            作用域回退，峰值实际只用了 403MB）。牛顿迭代的主机端控制流与 Python 版逐行同构。整个实现约 1400 行 CUDA C++。</p>
+        <h3>12.5 自检梯子</h3>
+        <p>手搭 FFT 最怕「悄悄算错」。上线前的分级自检，每级只暴露一类新风险：①加/减/进位 ↔ <code>__int128</code> 对拍；②schoolbook（精确）↔ FFT 乘法交叉对拍；③恒等式
+            (X+Y)² = X²+2XY+Y² 在<b>全部十种</b> FFT 规格（Q=4…2048，N=2¹³…2²²）上成立；④牛顿开方/倒数结果与精确值差 ≤3 个最末位；⑤300 → 30 万位 π
+            与基准逐位比对；⑥最后才是 100 万位。全部一次通过（这要感谢先有 CuPy 实现当「行为规范」——语义逐函数照抄，风险只剩 FFT 本身）。</p>
+        <h2 id="c13">13. 性能对比与分析</h2>
+        <h3>13.1 端到端与分阶段</h3>
+        <table>
+            <tr>
+                <th>阶段（100 万位）</th>
+                <th class="num">CuPy</th>
+                <th class="num">CUDA C++ Dx</th>
+            </tr>
+            <tr>
+                <td>初始化（含首次冷启动开方）</td>
+                <td class="num">1.5 s</td>
+                <td class="num" rowspan="3">0.85 s<br><span class="small">（牛顿 0.75s，其中 FFT 0.11s、进位 0.24s）</span></td>
+            </tr>
+            <tr>
+                <td>19 轮 AGM 迭代（大头是每轮的开方）</td>
+                <td class="num">14.2 s</td>
+            </tr>
+            <tr>
+                <td>最后一次除法</td>
+                <td class="num">0.9 s</td>
+            </tr>
+            <tr>
+                <td>数字输出</td>
+                <td class="num">0.1 s</td>
+                <td class="num">0.03 s</td>
+            </tr>
+            <tr>
+                <th>合计</th>
+                <th class="num">16.7 s</th>
+                <th class="num">0.88 s</th>
+            </tr>
+        </table>
+        <h3>13.2 单次大乘法微基准 —— 有趣的反转</h3>
+        <table>
+            <tr>
+                <th>两数各（limb）</th>
+                <th>FFT 规模</th>
+                <th class="num">CuPy (cuFFT)</th>
+                <th class="num">CUDA Dx（GEMM 路径）</th>
+                <th class="num">CUDA Dx（纯 FFT 路径）</th>
+            </tr>
+            <tr>
+                <td class="num">333,350</td>
+                <td>2²⁰</td>
+                <td class="num">2.35 ms</td>
+                <td class="num">1.52 ms</td>
+                <td class="num">1.48 ms</td>
+            </tr>
+            <tr>
+                <td class="num">666,700</td>
+                <td>2²¹</td>
+                <td class="num">2.34 ms</td>
+                <td class="num">2.97 ms</td>
+                <td class="num">2.89 ms</td>
+            </tr>
+            <tr>
+                <td class="num">1,333,400</td>
+                <td>2²²</td>
+                <td class="num">2.66 ms</td>
+                <td class="num">6.00 ms</td>
+                <td class="num">5.90 ms</td>
+            </tr>
+        </table>
+        <p>诚实地说：<b>单看一次大乘法，我们手搭的 FFT 并没有全面胜过 cuFFT</b>——2²⁰ 时略快（免掉了 Python/调度开销），2²² 时反而慢一倍多：cuFFT 对实数输入用了减半规模的 rfft
+            并有更精细的分解调度，而我们是朴素的复数变换加三次显存转置。那 19 倍的端到端差距从哪来？<b>开销，不是浮点。</b>CuPy 版一轮迭代要发射几百个小
+            kernel，每次<code>cmp</code>/进位判断都要把结果拷回 CPU 同步一次；Python 解释器再给每个数组操作加一层常数税。这些在 2 毫秒级的 FFT 面前统统不可忽略。CUDA C++
+            版把牛顿控制流留在主机、把判断压到最少、进位完全无同步，每轮迭代稳定在 40 毫秒——它赢在「把 GPU 喂饱」，而不是「算得更快」。</p>
+        <h3>13.3 cuBLASDx 的 GEMM 路径值不值？</h3>
+        <p>kernel B 有一个编译开关可以把「32 点 DFT=矩阵乘」换回纯 cuFFTDx 的 2048 点 FFT，两版 A/B 对比：端到端 0.882s vs 0.856s（GEMM 路径慢 3%），误差
+            2.1×10⁻⁴ vs 1.2×10⁻⁴。结论很有教益：在这个<b>访存主导</b>的流水线里，tensor core 的算力几乎是免费的（GEMM 级只占 kernel
+            时间的零头），但也换不来加速——瓶颈在显存带宽和转置，不在乘加。GEMM 路径的价值在于展示两个 Dx 库如何在同一个 kernel、同一块共享内存里协作，以及「换一种数学视角实现同一变换」的工程可行性。</p>
+        <h2 id="c14">14. 正确性验证</h2>
+        <p>三重证据链：</p>
+        <p>① <b>两实现互为对拍</b>：CuPy 与 CUDA C++ 两份输出文件（"3." + 1,000,000 位小数）逐字节一致。两条完全独立的代码路径（不同语言、不同
+            FFT、不同进位实现）得到同一串数字，共谋出错的概率可以忽略。
+        </p>
+        <p>② <b>与公开基准逐位比对</b>：结果的 100 万位小数与公开权威数据（MIT 镜像的 π 十亿位文件 <code>pi-billion.txt</code> 的前 100
+            万位）<b>全部一致</b>。基准数据本身先做了自校验：前 50
+            位、以及第 762–767 位著名的「费曼点」（连续六个 9）都逐一核对。</p>
+        <p>③ <b>全程红线监控</b>：每一次 FFT 乘法都检查舍入误差 &lt; 0.25（实测最大 2.1×10⁻⁴，从未触发）；牛顿迭代收尾以「修正量为零」为准；保护位方案先在 300 / 3,000 / 30,000
+            / 300,000 位上逐位验证再上百万；CUDA 实现另有第 12.5 节的六级自检梯子。</p>
+        <p>前 100 位与最后 10 位（第 999,991 – 1,000,000 位）：</p>
+        <div class="digits">
+            3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679…<br>……5779458151
+        </div>
+        <h2 id="c15">15. 结语</h2>
+        <p>这次旅程从一个数学定理出发（算术几何平均的二次收敛），落脚在一个线程块的共享内存里（32×64 的矩阵乘与 64 点 FFT）。几件值得带走的事：</p>
+        <p>• <b>算法先于实现</b>：二次收敛把「100 万位」压缩成 19 轮大运算——选对算法，问题的形状就先对了一半。<br>• <b>GPU 快的前提是「大块、规整、可并行」</b>：CuPy 版牛顿爬升里几百次小
+            kernel 加同步就能吃掉 16 秒，而同样的数学在 CUDA C++ 里整理成大块流水后只要 0.9 秒——上万个核心要用「整片数组」去喂。<br>•
+            <b>快算法会把压力转移给基础设施</b>：每轮一次全精度开方逼出了精度爬升与热启动；牛顿迭代的特殊数值形态逼出了进位前瞻。性能问题往往藏在「平均情况很好」的原语的最坏情况里。<br>• <b>GPU
+                上「快」有两种</b>：浮点吞吐与调度开销。百万位这个规模恰好在两者的分界线上——cuFFT 的浮点我们打不过，但把几百次同步压成零之后，端到端还是快了 19 倍。<br>• <b>DFT 与 GEMM
+                本是一家</b>：cuFFTDx 和 cuBLASDx 在同一个 kernel 里各拆一半 2048 点 FFT，tensor core 顺手把 DFT 矩阵乘掉——这是「库函数之下」那一层世界的日常。
+        </p>
+    </main>
+</body>
+
+</html>
