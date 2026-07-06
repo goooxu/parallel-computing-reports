@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inviting the Math Library into Your CUDA Kernel — A Pure Device-Side Math Workflow with nvmath-python (100 million digits of π as the Running Example)</title>
+<style>
+:root { --ink:#1c2733; --muted:#5b6b7b; --acc:#2c5f8f; --bg:#fbfbf9; --box:#f2f5f8; }
+* { box-sizing:border-box; }
+body { font-family:"Noto Sans CJK SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+       color:var(--ink); background:var(--bg); margin:0; line-height:1.75; }
+main { max-width:960px; margin:0 auto; padding:24px 20px 80px; }
+h1 { font-size:30px; margin:26px 0 4px; }
+h2 { font-size:22px; margin:44px 0 10px; border-left:5px solid var(--acc); padding-left:12px; }
+h3 { font-size:17px; margin:28px 0 8px; color:var(--acc); }
+p { margin:10px 0; }
+.subtitle { color:var(--muted); font-size:16px; margin-bottom:2px; }
+.meta { color:var(--muted); font-size:13px; border-bottom:1px solid #ddd; padding-bottom:14px; }
+.callout { background:var(--box); border-left:4px solid var(--acc); padding:10px 16px; border-radius:0 8px 8px 0; margin:14px 0; }
+.warn { border-left-color:#c07a3a; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:14px 0; }
+@media(max-width:680px){ .grid2 { grid-template-columns:1fr; } }
+.gbox { background:var(--box); border:1px solid #e2e6ea; border-radius:8px; padding:10px 14px; }
+pre.code { background:#20262e; color:#e8edf2; padding:14px 16px; border-radius:8px;
+           overflow-x:auto; font-size:13px; line-height:1.55; }
+pre.code code { font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace; }
+code { font-family:Consolas,monospace; background:#edf0f3; padding:1px 5px; border-radius:4px; font-size:0.92em; }
+pre.code code { background:none; padding:0; }
+table { border-collapse:collapse; margin:14px 0; width:100%; font-size:14px; }
+th, td { border:1px solid #d6dce2; padding:7px 10px; text-align:left; }
+th { background:#e8eef4; }
+td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+figure { margin:20px 0; text-align:center; }
+figure svg { width:100%; height:auto; background:#fff; border:1px solid #e2e6ea; border-radius:8px; }
+figcaption { color:var(--muted); font-size:13px; margin-top:6px; }
+.toc { background:var(--box); border-radius:8px; padding:14px 22px; }
+.toc a { color:var(--acc); text-decoration:none; display: block; }
+.digits { font-family:Consolas,monospace; font-size:13px; word-break:break-all;
+          background:#fff; border:1px dashed #bbb; padding:10px 12px; border-radius:6px; }
+math { font-size:1.08em; }
+math[display="block"] { display:block; margin:6px auto; overflow-x:auto; max-width:100%; }
+.mrow { text-align:center; margin:12px 0; background:var(--box); border:1px solid #e2e6ea;
+        border-radius:8px; padding:8px 12px; }
+.small { font-size:13px; color:var(--muted); }
+.pass { color:#1c7c3c; font-weight:bold; }
+</style></head><body><main>
+<h1>Inviting the Math Library into Your CUDA Kernel</h1>
+<p class="subtitle">Building a pure device-side math workflow with nvmath-python — with computing 100,000,000 digits of π as the running example: a complete record from library usage and large-FFT construction to a full round of performance engineering</p>
+<p class="meta">No third-party big-number library is used: big-integer addition, subtraction, multiplication (FFT), division, and square root are all implemented from scratch, and the result matches public π reference data digit for digit.</p>
+<div class="toc"><b>Contents</b><br><a href="#c1">1. Introduction: What This Tutorial Teaches</a><a href="#c2">2. A First Lesson in Parallelism: From "Loops" to "Whole Arrays"</a><a href="#c3">3. Phone Call, or Into the Kitchen</a><a href="#c4">4. Enter the Running Example: 100 million digits of π, and Why It Stresses Everything</a><a href="#c5">5. Math Building Blocks I: limb Big Numbers, Carries, and the All-Nines Reef</a><a href="#c6">6. Math Building Blocks II: FFT Multiplication and the 0.25 Red Line</a><a href="#c7">7. Math Building Blocks III: Newton's Iteration — Division and Square Roots from Multiplication Alone</a><a href="#c8">8. The Star Algorithm: Gauss–Legendre and Fixed-Point Scaling</a><a href="#c9">9. Newton's Two Weapons: Precision Ramping and Warm Starts</a><a href="#c10">10. A 2048-Point FFT Inside One Thread Block</a><a href="#c11">11. Beyond One Block: the Four-Step Method, Three-Level Decomposition, and a Spectrum That Is Never Reordered</a><a href="#c12">12. Move Fewer Bytes: 2-for-1 Packing and Load Fusion</a><a href="#c13">13. Fewer Launches, Coalesced Access: Two-Phase Carry and Memory-Access Shape</a><a href="#c14">14. Python's Launch Tax</a><a href="#c15">15. Deep Fusion: the Device-Side Library's Exclusive Advantage</a><a href="#c16">16. Compute Only the Slice You Need: the Exact Middle Product</a><a href="#c17">17. Fusion All the Way: the Frequency-Domain Three-in-One</a><a href="#c18">18. The Carry Pipeline: In Passing, Fused, and Sparse</a><a href="#c19">19. Correctness Verification</a><a href="#c20">20. Closing Remarks</a></div>
+<h2 id="c1">1. Introduction: What This Tutorial Teaches</h2>
+<p>There are two very different postures for using a math library on the GPU. The first is to <b>place a phone call</b>: you call a host-side library such as cuFFT — one function goes in, and the library finishes the job for you, launching kernels and handling scheduling on its own while you wait for the result. The second is to <b>invite the library into your own kernel</b>: cuFFTDx (the device-side FFT library in NVIDIA MathDx) finishes nothing on your behalf; it simply turns "a small FFT inside one thread block" into <b>one ordinary statement</b> in your kernel code — the data lives in your own registers and shared memory, and every byte of movement into and out of that statement is yours to manage.</p>
+<p>This tutorial walks the second posture from start to finish: how to assemble the transform's "recipe" in Python, how to execute it inside a CUDA kernel, how to stitch small "fits-in-one-block" transforms into a big 2<sup>28</sup>-point FFT, and — most important of all — how much performance "managing the data traffic yourself" is really worth. To give the answer some weight, we chose a running example that is punishing enough: <b>computing π to 100,000,000 digits on a single H100</b>, with all big-number arithmetic implemented from scratch. First, the report card:</p>
+<table><tr><th>Metric</th><th class="num">Value</th></tr><tr><td>Target</td><td class="num">100,000,000 decimal digits of π</td></tr><tr><td>Time</td><td class="num"><b>5.630 s</b></td></tr><tr><td>Correctness</td><td class="num"><span class="pass">PASS</span> (digit-for-digit match against the first 100 million digits of the public MIT reference, Section 19)</td></tr></table>
+<p>Beyond the report card, what this tutorial really wants to teach is "how we got there": the second half dissects the pipeline's performance engineering item by item — saving bytes, parallelizing the carries, memory-access shape, and, as the finale, deep kernel fusion. The deepest layer of that rework (folding pure data-movement work into the load/write-back phases of the compute kernels) can only be written when the FFT is "a line inside your kernel" — which is precisely the device-side library's exclusive advantage, and the meaning of this article's title.</p>
+<div class="callout">Roadmap: Sections 2–3 lay the groundwork (the mindset of parallelism, the two models of library use); Sections 4–9 assemble the math building blocks for the π case (limb big numbers, FFT multiplication, Newton's iteration, Gauss–Legendre); Sections 10–11 are the heart of the device-side methodology (inviting cuFFTDx into a Numba kernel, assembling the big FFT); Sections 12–18 dissect the performance engineering item by item (Section 14 tallies up the launch tax peculiar to Python, Section 16's exact middle product is the deepest cut, and Section 18's carry pipeline wraps it up); Section 19 covers verification and closing remarks. <b>Readers already familiar with GPUs and high-precision arithmetic can start reading at Section 10</b>; readers who only want the conclusions need only read Sections 1, 16, and 19.</div>
+<h2 id="c2">2. Parallelism 101: From "Loops" to "Whole Arrays"</h2>
+<div class="grid2"><div class="gbox"><b>CPU = a few PhD students</b><br>Few cores, but strong ones: good at complex logic where "each step depends on the previous one"; running a <code>for</code> loop means one cell at a time.</div><div class="gbox"><b>GPU = ten thousand schoolchildren</b><br>This H100 has over ten thousand CUDA cores; each knows only simple arithmetic, but they can all <b>start working at once</b>.</div></div>
+<p>The smallest unit of organization in a GPU program is the <b>thread</b>; threads are grouped into <b>thread blocks</b> (most blocks in this article hold 256 threads). Threads in the same block can cooperate through a small patch of ultra-fast <b>shared memory</b>, while blocks can only meet one another through <b>global memory</b>. To give tens of thousands of cores something to do, you have to rewrite the "element-by-element loop" as "a single operation over the whole array":</p>
+<figure><svg viewBox="0 0 720 190" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="13">
+<text x="10" y="18" font-size="14" fill="#5b6b7b">Serial CPU: n steps</text><text x="430" y="18" font-size="14" fill="#5b6b7b">Parallel GPU: once</text>
+<rect x="10" y="34" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/><rect x="10" y="66" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/><rect x="10" y="98" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/><rect x="10" y="130" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/>
+<text x="78" y="52">a[0]=b[0]+c[0]</text><text x="78" y="84">a[1]=b[1]+c[1]</text><text x="78" y="116">a[2]=b[2]+c[2]</text><text x="78" y="148">… (step n)</text>
+<path d="M39 60 L39 66 M39 92 L39 98 M39 124 L39 130" stroke="#c07a3a" stroke-width="2"/>
+<g transform="translate(430,0)"><rect x="0" y="34" width="56" height="122" fill="#eefaf2" stroke="#8fd3ad"/>
+<text x="7" y="52" fill="#1c7c3c">a[0]</text><text x="7" y="80" fill="#1c7c3c">a[1]</text><text x="7" y="108" fill="#1c7c3c">a[2]</text><text x="7" y="140" fill="#1c7c3c">a[n-1]</text>
+<text x="56" y="98">= b + c</text></g></svg><figcaption>Figure 1: On the left, <code>for i: a[i]=b[i]+c[i]</code> executes as n sequential steps; on the right, <code>a = b + c</code> completes all at once in parallel.</figcaption></figure>
+<div class="callout"><b>The most important sentence in this article:</b> every big-number operation that follows will be written as "an operation over the whole limb array" — that is what makes it truly run on the GPU. Any operation that cannot be written this way (such as the inherently serial digit-by-digit carry) must be recast into a parallel equivalent — the subject of Section 5 and Section 13.</div>
+<p>This lesson has a second half, and it is this article's distinctive angle: once loops become whole-array operations, <b>every "whole-array" pass is one full round of global-memory reads and writes</b>. For 100-million-digit π, the intermediate arrays easily run to 4GB, and every extra trip through global memory costs a few extra milliseconds. Whoever controls the number of passes controls the performance — and that is precisely the watershed between the two library-usage models in the next section.</p>
+<h2 id="c3">3. Phone Call, or Into the Kitchen</h2>
+<p>Start with the familiar <b>host-call model</b>. To run one "transform — pointwise multiply — inverse transform" pipeline with cuFFT, the host code typically looks like this:</p>
+<pre class="code"><code># Sketch: one big-number multiplication under the host-call model
+buf = to_complex(a_limbs)                      # ① Preprocess: launch a kernel of your own first — one full-length read/write
+fa = cp.fft.fft(buf)                           # ② Phone call: the library launches its own kernel for the forward transform
+fb = cp.fft.fft(to_complex(b_limbs))           # ③ The second operand: another phone call
+spec = fa * fb                                 # ④ Pointwise multiply: cupy launches yet another kernel for this one line
+raw = cp.fft.ifft(spec)                        # ⑤ Inverse transform (one more phone call)
+digits = cp.rint(raw.real)                     # ⑥ Rounding: yet another full-length read/write
+carry_kernel[blocks, 256](digits, out_limbs)   # ⑦ Per-digit carries: your own Numba kernel finishes the job
+# Between every step the data crosses global memory in full; not one line can be squeezed inside the library's kernels</code></pre>
+<p>The contract of this model is clear: you build the plan on the CPU (the library's execution-plan handle), put the data in global memory, place a phone call, and the library launches <b>its own</b> kernel to finish that step. Painless, mature, fast — but two restrictions are written into the contract in permanent ink: <b>① between every step, the data must lie back in global memory in full</b> (library kernels accept nothing but global-memory pointers for input and output); <b>② you cannot insert a single line of code inside a library kernel</b> (want to do a type conversion in passing while loading? Sorry — first launch a kernel of your own to convert the types).</p>
+<p>The <b>device-inline model</b> tears up both clauses of that contract. cuFFTDx enters Python through nvmath-python's device-side API: at <b>construction time</b> you declare the transform you want by "assembling the ingredients as keyword arguments", and it hands you a descriptor; inside <b>your own kernel</b>, that descriptor's <code>execute()</code> completes an FFT within one thread block on the spot — no new kernel is launched, and the data stays in your registers and shared memory the whole way:</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — the minimal device-inline skeleton (make_stageD): the library's FFT is one line inside your kernel
+def make_stageD(Q, inv):
+    fpb = min(256, 2048 // Q)
+    fft = _dx(Q, inv, fpb)
+    ...
+    @cuda.jit
+    def k_stageD(data, rowStride):
+        rd = cuda.local.array(shape=(st,), dtype=vt)
+        sm = cuda.shared.array(shape=(0,), dtype=vt)
+        base = cuda.blockIdx.y * rowStride
+        offset = (cuda.blockIdx.x * fpb + cuda.threadIdx.y) * Q
+        for i in range(ept):
+            e = cuda.threadIdx.x + i * stride
+            if e &lt; Q:
+                rd[i] = data[base + offset + e]
+        fft.execute(rd, sm)
+        for i in range(ept):
+            e = cuda.threadIdx.x + i * stride
+            if e &lt; Q:
+                data[base + offset + e] = rd[i]</code></pre>
+<div class="grid2"><div class="gbox"><b>Who they are</b><br>Dx = <b>D</b>evice E<b>x</b>tensions. cuFFTDx belongs to the NVIDIA <b>MathDx</b> collection — device-side math libraries released independently of the CUDA Toolkit, a family that also includes cuSolverDx (factorizations/eigenvalues), cuRANDDx (random numbers), and nvCOMPDx (compression). This article uses cuFFTDx from pure Python through <b>nvmath-python</b>'s <code>nvmath.device</code> API: one pip line and it is installed.</div><div class="gbox"><b>Timeline and requirements</b><br>cuFFTDx is the eldest: after an early-access phase, 2022 saw its official 1.0 release; nvmath-python, which brings it into the Python world, is far younger — the device-side API is still marked beta and evolving fast.</div></div>
+<figure><svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ahd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="215" y="22" font-size="14" text-anchor="middle" fill="#222">Host-call model (cuFFT / cuBLAS)</text>
+<text x="645" y="22" font-size="14" text-anchor="middle" fill="#222">Device-inline model (cuFFTDx)</text>
+<rect x="40" y="40" width="350" height="52" rx="6" fill="#eef3fa" stroke="#666"/>
+<text x="215" y="61" text-anchor="middle">CPU: build plan, call cufftExecD2Z(...)</text>
+<text x="215" y="80" text-anchor="middle" fill="#5b6b7b">every step is one "phone call"</text>
+<rect x="60" y="128" width="140" height="44" rx="6" fill="#f4e9e9" stroke="#666"/><text x="130" y="147" text-anchor="middle">Library kernel A</text><text x="130" y="163" text-anchor="middle" fill="#5b6b7b">(black box)</text>
+<rect x="230" y="128" width="140" height="44" rx="6" fill="#f4e9e9" stroke="#666"/><text x="300" y="147" text-anchor="middle">Library kernel B</text><text x="300" y="163" text-anchor="middle" fill="#5b6b7b">(black box)</text>
+<rect x="40" y="216" width="350" height="40" rx="6" fill="#faf0e6" stroke="#666"/>
+<text x="215" y="240" text-anchor="middle">Global memory: full in/out between steps</text>
+<line x1="130" y1="92" x2="130" y2="126" stroke="#666" marker-end="url(#ahd)"/>
+<line x1="300" y1="92" x2="300" y2="126" stroke="#666" marker-end="url(#ahd)"/>
+<line x1="110" y1="172" x2="110" y2="214" stroke="#c07a3a" stroke-width="2" marker-end="url(#ahd)"/>
+<line x1="150" y1="214" x2="150" y2="174" stroke="#c07a3a" stroke-width="2" marker-end="url(#ahd)"/>
+<line x1="280" y1="172" x2="280" y2="214" stroke="#c07a3a" stroke-width="2" marker-end="url(#ahd)"/>
+<line x1="320" y1="214" x2="320" y2="176" stroke="#c07a3a" stroke-width="2" marker-end="url(#ahd)"/>
+<text x="215" y="285" text-anchor="middle" fill="#c07a3a">↑ each arrow: one full memory read or write</text>
+<text x="215" y="304" text-anchor="middle" fill="#5b6b7b">not one line fits inside the library kernel</text>
+<rect x="470" y="40" width="350" height="216" rx="8" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="2"/>
+<text x="645" y="62" text-anchor="middle" fill="#1c7c3c">one kernel of your own</text>
+<rect x="495" y="76" width="300" height="40" rx="6" fill="#fff" stroke="#666"/>
+<text x="645" y="100" text-anchor="middle">Custom load (in passing: convert/twiddle/permute)</text>
+<rect x="495" y="130" width="300" height="40" rx="6" fill="#fdeeee" stroke="#666"/>
+<text x="645" y="154" text-anchor="middle" font-family="monospace">FFT().execute(rd, smem)  ← the library is here</text>
+<rect x="495" y="184" width="300" height="40" rx="6" fill="#fff" stroke="#666"/>
+<text x="645" y="208" text-anchor="middle">Custom write-back (round/reorder/multiply)</text>
+<line x1="565" y1="118" x2="565" y2="128" stroke="#666" marker-end="url(#ahd)"/>
+<line x1="565" y1="172" x2="565" y2="182" stroke="#666" marker-end="url(#ahd)"/>
+<rect x="470" y="268" width="350" height="34" rx="6" fill="#faf0e6" stroke="#666"/>
+<text x="645" y="289" text-anchor="middle">Memory: one trip in, one trip out</text>
+<line x1="600" y1="256" x2="600" y2="266" stroke="#1c7c3c" stroke-width="2" marker-end="url(#ahd)"/>
+<line x1="690" y1="266" x2="690" y2="258" stroke="#1c7c3c" stroke-width="2" marker-end="url(#ahd)"/>
+</svg><figcaption>Figure 2: Data paths of the two models. Left: a full round trip through global memory between every step, with the library kernels as black boxes; right: one trip in, one trip out for the whole pipeline, with the load and write-back phases as your own code — free to do whatever you like "in passing".</figcaption></figure>
+<table><tr><th></th><th>Host call (cuFFT/cuBLAS)</th><th>Device-inline (cuFFTDx)</th></tr><tr><td>Who launches kernels</td><td>The library (a black box)</td><td>You (the library is just one line in your kernel)</td></tr><tr><td>Where the data lives</td><td>In and out of global memory at every step</td><td>Your registers / shared memory</td></tr><tr><td>Can pre/post-processing be fused?</td><td>Essentially no (the only official opening is the callback mechanism — narrow and brittle)</td><td>Fuse at will — the load and write-back phases are your code</td></tr><tr><td>Size ceiling</td><td>Nearly unlimited</td><td>Whatever fits in one thread block (a few thousand points at fp64)</td></tr><tr><td>Maturity</td><td>Two decades of polish</td><td>You assemble it yourself, and correctness is on you (Section 19)</td></tr></table>
+<div class="callout"><b>Foreshadowing for the whole article:</b> every byte moved before and after the line <code>fft.execute(rd, smem)</code> is yours to manage. The deepest layer of the performance engineering in Sections 12–16 grows out of verbs like "do the twiddle in passing during the load phase" and "do the rounding in passing during the write-back phase" — verbs that <b>simply do not exist</b> in the host-call model.</div>
+<p>Of course, there is no free lunch: the device-inline model's ceiling is "whatever fits in one thread block", and we need 2<sup>28</sup> points — the big FFT has to be split apart and reassembled by hand (Section 11); and when you assemble it wrong, nobody catches you, so you must also build a verification ladder of your own (Section 19). First, let's see just how big this case really is.</p>
+<h2 id="c4">4. Enter the Running Example: 100 Million Digits of π, and Why It Stresses Everything</h2>
+<p>Why can't we just compute the digits directly? <b>Floating point can't hold them.</b> A <code>float64</code> carries only about 15–16 significant digits — 7 orders of magnitude short of 100 million. This is not a precision shortfall; the type simply has nowhere near that many slots. And since the GPU has no ready-made "big integer" type, we must <b>assemble one big number ourselves out of a large array of small ones</b> (Section 5), then translate big-number addition, subtraction, multiplication, and division entirely into whole-array operations. Here is the workload profile of this case:</p>
+<table><tr><th>Metric</th><th class="num">Value</th><th>Meaning</th></tr><tr><td>Target digits / working precision p</td><td class="num">10<sup>8</sup> / 100,000,050</td><td>50 guard digits, p a multiple of 3</td></tr><tr><td>limb array length</td><td class="num">33,333,350</td><td>each limb holds 3 decimal digits (base 1000, int32)</td></tr><tr><td>AGM iteration rounds</td><td class="num">26</td><td>quadratic convergence: matching digits double every round (Section 8)</td></tr><tr><td>Newton steps</td><td class="num">443</td><td>one full-precision square root per round + one final reciprocal (Section 9)</td></tr><tr><td>Large FFT multiplications</td><td class="num">1062</td><td>largest size N = 2<sup>28</sup> (Section 11)</td></tr><tr><td>Max FFT rounding error</td><td class="num">0.00781</td><td>the red line is 0.25 (Section 6)</td></tr><tr><td>Peak GPU memory</td><td class="num">≈ 6.5 GB</td><td>temporaries in a single Newton step can reach ~12GB (7.9 after arena pooling and reuse, 6.5 after the middle product shrinks the FFTs)</td></tr></table>
+<p>Why choose this as the tutorial's case study? Because it forces every link of the device-side workflow into the spotlight: the large FFT must be assembled by hand from block-level building blocks (2<sup>28</sup> points is far beyond one block's capacity); 1062 large multiplications amplify every redundant pass of GPU-memory reads and writes a thousandfold; 26 rounds of iteration and hundreds of Newton steps leave kernel-launch overhead nowhere to hide; and "correct to every digit" means every trick has to pass the verification gate.</p>
+<div class="callout">Division of roles: the mathematics of π (Sections 5–9) is the <b>building blocks</b> — it decides what we compute; the device-side methodology and performance engineering (Sections 10–18) is the <b>star</b> — it decides how fast that same mathematics runs. Readers in a hurry can skip Sections 5–9, treating them as a reference manual, without losing the main thread.</div>
+<h2 id="c5">5. Math Building Blocks I: limb Big Numbers, Carries, and the 999…9 Reef</h2>
+<p><b>Representation.</b> Chop the big integer into many small numbers in the range 0–999; each one is called a <b>limb</b>, and the whole thing is an <code>int32</code> array (least significant limb first). We choose base B=1000 (=10³) because the final answer must come out in decimal: each limb is exactly 3 decimal digits, so output costs nothing. A 100-million-digit π is an array of about 33.33 million limbs (a bit over 130MB).</p>
+<figure><svg viewBox="0 0 660 92" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="14">
+<text x="10" y="16" font-size="12" fill="#5b6b7b">Value 12,345,678 = 678 + 345·1000 + 12·1000²</text>
+<g transform="translate(0,28)"><rect x="20" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0"/><text x="52" y="25">12</text>
+<rect x="120" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0"/><text x="145" y="25">345</text>
+<rect x="220" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0"/><text x="245" y="25">678</text>
+<text x="20" y="55" font-size="11" fill="#5b6b7b">limb[2] (high)</text><text x="230" y="55" font-size="11" fill="#5b6b7b">limb[0] (low)</text></g></svg><figcaption>Figure 3: A big integer = an array of limbs (little-endian; index 0 is the least significant).</figcaption></figure>
+<p><b>Addition and carries.</b> The grade-school method — "add position by position, carry when you hit a thousand" — is inherently serial (the carry at position k must wait for position k−1), which puts it squarely in the crosshairs of Section 2's whole-array mindset. On the GPU we split it in two: first <b>add the whole array at once</b> (some limbs temporarily exceed 999 — never mind), then <b>propagate the carries in parallel</b>. That propagation step hides the most dangerous reef in the entire project: Newton's iteration (Section 7) systematically manufactures numbers like <b>a 1 followed by hundreds of thousands of 0s</b> (or 999…9 when it lands just short) — a single +1 carry then has to travel the full length of that chain of 0s/9s. The naive parallel scheme — "many passes, each pushing the carries one position" — degenerates to O(n) passes on such inputs: in one multiplication at the million-digit scale, carry propagation alone takes 166,679 passes — well over a hundred thousand kernel launches, with launch overhead by itself running to tens of seconds. Completely unusable.</p>
+<p>The fix has the same pedigree as the classic answer in hardware adders — <b>carry-lookahead</b>. The observation: a residual carry can only "pass through" a 999 (a borrow, only through a 000); any other digit absorbs it. So "will position i receive a carry" = "does the nearest non-999 position below i fire" — and that is a <b>prefix scan</b>: it computes every position at once, and no matter how long the chain, one pass goes all the way:</p>
+<pre class="code"><code># Serial carry (one step at a time)       # Parallel prefix (one scan, all the way)
+carry = 0                                 # when the residual carry ∈ {0,±1}:
+for i in range(n):                        #   999 lets a carry pass through (propagate)
+    v = s[i] + carry                      #   ≥1000 always produces a carry (generate)
+    s[i] = v % 1000                       # (g,p) form an associative semigroup → blocked prefix scan
+    carry = v // 1000                     # three CUDA kernels: in-block reduce → cross-block chain → apply</code></pre>
+<div class="callout warn"><b>Lesson:</b> the "average-case" performance of a vectorized primitive can hide an O(n) worst case — and numerical algorithms are exactly the workloads that systematically manufacture worst-case inputs. <b>Fast algorithms shift the pressure onto the infrastructure.</b></div>
+<p class="small">Subtraction uses the symmetric borrow formulation; comparison scans from the most significant end for the first differing limb; "divide by 2" has a slick parallel trick: base 1000 is even, so the result at position i = <code>d[i]/2 + 500·(d[i+1] is odd)</code> — every limb computed in one shot, no propagation needed. The CUDA implementations of all these primitives live in <code>common.py</code>. The final form of carrying (the exact two-phase carry) arrives in Section 13.</p>
+<h2 id="c6">6. Math Building Blocks II: FFT Multiplication and the 0.25 Red Line</h2>
+<p>Think of a big number as a "base-1000 polynomial," and multiplying two numbers = a <b>convolution</b> of their coefficients. Naive convolution is O(n²) — at 33.33 million limbs that is roughly 10<sup>15</sup> multiply-adds, tens of minutes of computing, and we have to do it 1062 times. The <b>convolution theorem</b> offers a shortcut:</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>x</mi><mo>&#8901;</mo><mi>y</mi><mo>=</mo><msup><mi>F</mi><mrow><mo>&#8722;</mo><mn>1</mn></mrow></msup><mrow><mo>(</mo><mi>F</mi><mo>(</mo><mi>x</mi><mo>)</mo><mo>&#8857;</mo><mi>F</mi><mo>(</mo><mi>y</mi><mo>)</mo><mo>)</mo></mrow><mo>,&#x2003;</mo><mtext>&#9737; denotes pointwise multiplication</mtext></mrow></math></div>
+<figure><svg viewBox="0 0 680 155" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="12.5">
+<rect x="20" y="26" width="140" height="36" fill="#fdecec" stroke="#e6a6a6"/><text x="90" y="49" text-anchor="middle">Two coeff arrays</text>
+<rect x="20" y="104" width="140" height="34" fill="#eefaf2" stroke="#8fd3ad"/><text x="90" y="126" text-anchor="middle">Prod coeffs</text>
+<text x="90" y="86" text-anchor="middle" fill="#c07a3a" font-size="11">Direct conv O(n²) ✗</text>
+<rect x="270" y="10" width="150" height="32" fill="#eef4ff" stroke="#9db8f0"/><text x="345" y="31" text-anchor="middle">Spectra (each)</text>
+<rect x="270" y="120" width="150" height="30" fill="#eef4ff" stroke="#9db8f0"/><text x="345" y="140" text-anchor="middle">Freq prod</text>
+<path d="M162 38 C 230 18,250 18,270 26" fill="none" stroke="#2c5f8f" stroke-width="2"/><text x="205" y="14" fill="#2c5f8f">① FFT</text>
+<path d="M345 42 L345 120" stroke="#2c5f8f" stroke-width="2"/><text x="352" y="86" fill="#2c5f8f">② pointwise ×</text>
+<path d="M270 135 C 220 140,200 135,162 125" fill="none" stroke="#2c5f8f" stroke-width="2"/><text x="195" y="152" fill="#2c5f8f">③ IFFT</text>
+<text x="470" y="80" fill="#1c7c3c" font-size="13">Total O(n log n) ✓</text></svg><figcaption>Figure 4: FFT multiplication — turning the hard convolution into an easy pointwise product, for a total cost of O(n log n).</figcaption></figure>
+<p><b>How does floating point produce exact integers?</b> The FFT runs on float64 internally, and float64 represents integers exactly up to 2<sup>53</sup> ≈ 9×10<sup>15</sup>. At 100 million digits the largest convolution coefficient is about n·999² ≈ 3.34×10<sup>7</sup>×10<sup>6</sup> ≈ 3.3×10<sup>13</sup> — still a factor of about 270 below the limit. But that only means "the coefficients themselves fit"; the FFT's tens of millions of floating-point multiply-adds also accumulate rounding error, so every multiplication is guarded by a <b>safety valve</b>: check how far each floating-point result sits from the nearest integer, and the moment that distance exceeds 0.25, raise an error and abort — never silently compute a wrong answer:</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — the 0.25 red line on every multiplication: residuals accumulate device-side, checkpoints read back and pass judgment
+def fft_error_read():
+    bits = int(g_err.get()[0])
+    cp.cuda.runtime.memsetAsync(g_err.data.ptr, 0, 8, 0)
+    return np.frombuffer(np.int64(bits).tobytes(), dtype=np.float64)[0]
+
+def fft_error_checkpoint(where=""):
+    # Residuals accumulate device-side; checkpoints read back and pass judgment (the red line is never lifted)
+    err = fft_error_read()
+    if err > g_cnt.fft_err_max:
+        g_cnt.fft_err_max = err
+    assert err &lt; 0.25, f"FFT rounding error too large: {err} at {where}"</code></pre>
+<p>The measured maximum error across the full 100-million-digit run is 0.00781 — an order of magnitude below the red line, yet already revealing: base 1000 is nearing its limit at the 2<sup>28</sup>-point scale (ten times bigger and we would have to switch to base 100). That is precisely the red line's value: it turns "precision is about to run out" into an explicitly observable quantity, rather than a string of wrong digits quietly showing up one day.</p>
+<p class="small">Very small multiplications (where the product of the two operands' lengths — i.e., the number of O(n²) multiply-adds — is ≤ 1.6×10<sup>7</sup>) go straight to a schoolbook kernel, dodging the FFT's fixed overhead — the low levels of Newton's precision ramping are all small multiplications of this kind.</p>
+<h2 id="c7">7. Math Building Blocks III: Newton's Iteration — Division and Square Roots from Multiplication Alone</h2>
+<p>Computing π also calls for division and square roots, but we only want to use the multiplication we have already built. Newton's iteration makes that possible. To compute the reciprocal 1/T:</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>x</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msub><mi>x</mi><mi>n</mi></msub><mo>&#8290;</mo><mo>(</mo><mn>2</mn><mo>&#8722;</mo><mi>T</mi><mo>&#8901;</mo><msub><mi>x</mi><mi>n</mi></msub><mo>)</mo></math></div>
+<p>To compute the reciprocal square root 1/√K (taking a square root is then just √K = K·(1/√K)):</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>y</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><mfrac><mrow><msub><mi>y</mi><mi>n</mi></msub><mo>&#8290;</mo><mo>(</mo><mn>3</mn><mo>&#8722;</mo><mi>K</mi><mo>&#8901;</mo><msubsup><mi>y</mi><mi>n</mi><mn>2</mn></msubsup><mo>)</mo></mrow><mn>2</mn></mfrac></math></div>
+<p>Both iterations involve nothing but multiplication, subtraction, and "division by 2" (the parallel halving from Section 5), and both exhibit <b>quadratic convergence</b> — each iteration step <b>doubles</b> the number of correct digits: 15 → 30 → 60 → … → 10<sup>8</sup>, so starting from a <code>float64</code> seed, about 23 steps get you all the way there. In the integer world, 1/√K is represented in the fixed-point scaled-up form y ≈ B<sup>h</sup>/√K (h is slightly larger than K's limb count; the implementation uses h = len(K)+2, so K·y² ≈ B<sup>2h</sup>, which is exactly where the residual B<sup>2h</sup> − K·y² in Section 9's code comes from), and "dividing by a power of B" is simply dropping an entire low-order block of the array — exact and zero-cost.</p>
+<div class="callout">Remember "digits double every step" — Section 8's choice of algorithm and Section 9's two weapons are all built on this one property.</div>
+<h2 id="c8">8. The Star Algorithm: Gauss–Legendre and Fixed-Point Scaling</h2>
+<p>With the infrastructure in place, which formula do we use to compute π? The most famous candidate, the Leibniz series, is a cautionary tale:</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mi>&#960;</mi><mn>4</mn></mfrac><mo>=</mo><mn>1</mn><mo>&#8722;</mo><mfrac><mn>1</mn><mn>3</mn></mfrac><mo>+</mo><mfrac><mn>1</mn><mn>5</mn></mfrac><mo>&#8722;</mo><mfrac><mn>1</mn><mn>7</mn></mfrac><mo>+</mo><mo>&#8943;</mo></math></div>
+<p>A million terms buy you just 6–7 digits. History offers series that converge far faster (the good ones contribute a dozen-plus digits per term), but all series share one ceiling: the number of correct digits is <b>proportional</b> to the number of terms (linear convergence), and merging an ocean of tiny terms is exactly the fragmented workload GPUs like least. Gauss–Legendre (Brent–Salamin, 1976) does not sum a series at all — it repeatedly applies a set of extremely simple transformations:</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><msub><mi>a</mi><mn>0</mn></msub><mo>=</mo><mn>1</mn><mo>,</mo><msub><mi>b</mi><mn>0</mn></msub><mo>=</mo><mfrac><mn>1</mn><msqrt><mn>2</mn></msqrt></mfrac><mo>,</mo><msub><mi>t</mi><mn>0</mn></msub><mo>=</mo><mfrac><mn>1</mn><mn>4</mn></mfrac><mo>,</mo><msub><mi>p</mi><mn>0</mn></msub><mo>=</mo><mn>1</mn></mrow></math></div>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><msub><mi>a</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><mfrac><mrow><msub><mi>a</mi><mi>n</mi></msub><mo>+</mo><msub><mi>b</mi><mi>n</mi></msub></mrow><mn>2</mn></mfrac><mo>,&#x2003;</mo><msub><mi>b</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msqrt><mrow><msub><mi>a</mi><mi>n</mi></msub><msub><mi>b</mi><mi>n</mi></msub></mrow></msqrt><mo>,&#x2003;</mo><msub><mi>t</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msub><mi>t</mi><mi>n</mi></msub><mo>&#8722;</mo><msub><mi>p</mi><mi>n</mi></msub><msup><mrow><mo>(</mo><msub><mi>a</mi><mi>n</mi></msub><mo>&#8722;</mo><msub><mi>a</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>)</mo></mrow><mn>2</mn></msup><mo>,&#x2003;</mo><msub><mi>p</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><mn>2</mn><msub><mi>p</mi><mi>n</mi></msub></mrow></math></div>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>&#960;</mi><mo>&#8776;</mo><mfrac><msup><mrow><mo>(</mo><msub><mi>a</mi><mi>n</mi></msub><mo>+</mo><msub><mi>b</mi><mi>n</mi></msub><mo>)</mo></mrow><mn>2</mn></msup><mrow><mn>4</mn><msub><mi>t</mi><mi>n</mi></msub></mrow></mfrac></mrow></math></div>
+<p>a takes the arithmetic mean and b the geometric mean, and the two close in on each other at an astonishing rate (their common limit is called the "arithmetic–geometric mean", AGM). The key property is the same one Newton offers: <b>quadratic convergence, with matching digits doubling every round</b> — 100 million digits take only 26 rounds, and each round is a big whole-array operation, exactly the workload shape GPUs love:</p>
+<figure><svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12" role="img"><text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">Matching digits of a, b double every round (log scale); stop criterion fires after round 26 </text><line x1="70" y1="40" x2="70" y2="240" stroke="#999"/><line x1="70" y1="240" x2="830" y2="240" stroke="#999"/><line x1="66" y1="240" x2="70" y2="240" stroke="#999"/><text x="62" y="244" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">0</tspan></text><line x1="66" y1="192" x2="70" y2="192" stroke="#999"/><text x="62" y="196" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">2</tspan></text><line x1="66" y1="145" x2="70" y2="145" stroke="#999"/><text x="62" y="149" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">4</tspan></text><line x1="66" y1="98" x2="70" y2="98" stroke="#999"/><text x="62" y="102" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">6</tspan></text><line x1="66" y1="50" x2="70" y2="50" stroke="#999"/><text x="62" y="54" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">8</tspan></text><line x1="70" y1="57" x2="830" y2="57" stroke="#c07a3a" stroke-width="1.5" stroke-dasharray="6 4"/><text x="82" y="51" font-size="11" fill="#c07a3a">Stop criterion 2g ≥ p+30 (g ≈ 5×10⁷)</text><polyline points="98.5,236.8 126.9,229.6 155.4,222.5 183.8,215.3 212.3,208.2 240.8,201.0 269.2,193.9 297.7,186.7 326.2,179.6 354.6,172.5 383.1,165.3 411.5,158.2 440.0,151.0 468.5,143.9 496.9,136.7 525.4,129.6 553.8,122.4 582.3,115.3 610.8,108.1 639.2,101.0 667.7,93.8 696.2,86.7 724.6,79.5 753.1,72.4 781.5,65.2 810.0,58.1" fill="none" stroke="#2c5f8f" stroke-width="2"/><circle cx="98.5" cy="236.8" r="3.5" fill="#2c5f8f"><title>Round 1: ≈ 1 digits</title></circle><text x="98.5" y="256" font-size="11" text-anchor="middle" fill="#555">1</text><circle cx="126.9" cy="229.6" r="3.5" fill="#2c5f8f"><title>Round 2: ≈ 2 digits</title></circle><circle cx="155.4" cy="222.5" r="3.5" fill="#2c5f8f"><title>Round 3: ≈ 5 digits</title></circle><circle cx="183.8" cy="215.3" r="3.5" fill="#2c5f8f"><title>Round 4: ≈ 10 digits</title></circle><text x="183.8" y="256" font-size="11" text-anchor="middle" fill="#555">4</text><circle cx="212.3" cy="208.2" r="3.5" fill="#2c5f8f"><title>Round 5: ≈ 21 digits</title></circle><circle cx="240.8" cy="201.0" r="3.5" fill="#2c5f8f"><title>Round 6: ≈ 43 digits</title></circle><circle cx="269.2" cy="193.9" r="3.5" fill="#2c5f8f"><title>Round 7: ≈ 87 digits</title></circle><circle cx="297.7" cy="186.7" r="3.5" fill="#2c5f8f"><title>Round 8: ≈ 174 digits</title></circle><text x="297.7" y="256" font-size="11" text-anchor="middle" fill="#555">8</text><circle cx="326.2" cy="179.6" r="3.5" fill="#2c5f8f"><title>Round 9: ≈ 349 digits</title></circle><circle cx="354.6" cy="172.5" r="3.5" fill="#2c5f8f"><title>Round 10: ≈ 698 digits</title></circle><circle cx="383.1" cy="165.3" r="3.5" fill="#2c5f8f"><title>Round 11: ≈ 1,397 digits</title></circle><circle cx="411.5" cy="158.2" r="3.5" fill="#2c5f8f"><title>Round 12: ≈ 2,794 digits</title></circle><text x="411.5" y="256" font-size="11" text-anchor="middle" fill="#555">12</text><circle cx="440.0" cy="151.0" r="3.5" fill="#2c5f8f"><title>Round 13: ≈ 5,588 digits</title></circle><circle cx="468.5" cy="143.9" r="3.5" fill="#2c5f8f"><title>Round 14: ≈ 11,176 digits</title></circle><circle cx="496.9" cy="136.7" r="3.5" fill="#2c5f8f"><title>Round 15: ≈ 22,353 digits</title></circle><circle cx="525.4" cy="129.6" r="3.5" fill="#2c5f8f"><title>Round 16: ≈ 44,707 digits</title></circle><text x="525.4" y="256" font-size="11" text-anchor="middle" fill="#555">16</text><circle cx="553.8" cy="122.4" r="3.5" fill="#2c5f8f"><title>Round 17: ≈ 89,415 digits</title></circle><circle cx="582.3" cy="115.3" r="3.5" fill="#2c5f8f"><title>Round 18: ≈ 178,831 digits</title></circle><circle cx="610.8" cy="108.1" r="3.5" fill="#2c5f8f"><title>Round 19: ≈ 357,663 digits</title></circle><circle cx="639.2" cy="101.0" r="3.5" fill="#2c5f8f"><title>Round 20: ≈ 715,326 digits</title></circle><text x="639.2" y="256" font-size="11" text-anchor="middle" fill="#555">20</text><circle cx="667.7" cy="93.8" r="3.5" fill="#2c5f8f"><title>Round 21: ≈ 1,430,652 digits</title></circle><circle cx="696.2" cy="86.7" r="3.5" fill="#2c5f8f"><title>Round 22: ≈ 2,861,304 digits</title></circle><circle cx="724.6" cy="79.5" r="3.5" fill="#2c5f8f"><title>Round 23: ≈ 5,722,608 digits</title></circle><circle cx="753.1" cy="72.4" r="3.5" fill="#2c5f8f"><title>Round 24: ≈ 11,445,217 digits</title></circle><text x="753.1" y="256" font-size="11" text-anchor="middle" fill="#555">24</text><circle cx="781.5" cy="65.2" r="3.5" fill="#2c5f8f"><title>Round 25: ≈ 22,890,435 digits</title></circle><circle cx="810.0" cy="58.1" r="3.5" fill="#2c5f8f"><title>Round 26: ≈ 45,780,870 digits</title></circle><text x="800.0" y="50.1" font-size="11" text-anchor="end" fill="#2c5f8f">Measured anchor: round 26 entry 45,780,870 digits; doubles past line</text><text x="430" y="292" font-size="11.5" text-anchor="middle" fill="#5b6b7b">Curve: theoretical track from the anchor, doubling per round; x-axis: rounds</text></svg><figcaption>Figure 5: Matching digits double every round. Entering round 26, the measured agreement is 45,780,870 digits; that round doubles it to ≈91.56 million digits, over the threshold, and the 2g ≥ p+30 stop criterion fires at the next check (the curve is the theoretical trajectory back-extrapolated from this anchor under the quadratic-convergence law).</figcaption></figure>
+<p>The price is equally explicit: <b>every round takes one square root at full 100-million-digit precision</b> (b′=√(ab)), and the wrap-up adds one division at the same precision. Whether this algorithm is fast comes down entirely to how fast big-number multiplication is and how cleverly Newton's iteration is run — which channels all the pressure straight onto our infrastructure.</p>
+<p><b>Fixed-point scaling</b> solves the "real numbers into an integer library" problem: every quantity is multiplied by 10<sup>p</sup> and stored as an integer (p = 100,000,050, a multiple of 3 → exactly 33,333,350 limbs). Every real-number operation then corresponds strictly to one integer operation:</p>
+<table><tr><th>Real-number world</th><th>Fixed-point integer world (everything ×10<sup>p</sup>)</th><th>Primitives used</th></tr><tr><td>(a+b)/2</td><td>(A+B)/2</td><td>Addition + halving in an even base (no carry propagation)</td></tr><tr><td>√(a·b)</td><td>isqrt(A·B): A·B carries 10<sup>2p</sup>; the square root lands exactly back on 10<sup>p</sup></td><td>Multiplication + Newton square root</td></tr><tr><td>t − p·(a−a′)²</td><td>T − pₙ·(D² shifted right by p digits)</td><td>Multiplication + shift (dropped low digits = truncation)</td></tr><tr><td>(a+b)²/(4t)</td><td>(A+B)²·recip(4T), then shift right</td><td>Multiplication + Newton reciprocal</td></tr></table>
+<p>Truncation error taints only the lowest few digits each round, and the 26-round total stays far below the 50 guard digits (verified digit by digit at small scales before going to 100 million). The skeleton of the main loop:</p>
+<pre class="code"><code># Excerpt from pi-numba/pi_agm.py — the AGM main loop of run_pi: 4 resident slots reuse GPU memory; temporaries reclaimed each round
+    slotA = C.g_arena.alloc(slot_cap * 4, C.LIMB_DT)
+    slotB = C.g_arena.alloc(slot_cap * 4, C.LIMB_DT)
+    slotT = C.g_arena.alloc(slot_cap * 4, C.LIMB_DT)
+    slotY = C.g_arena.alloc(slot_cap * 4, C.LIMB_DT)
+    ...
+    mark0 = C.g_arena.save()
+    ...
+    while True:
+        ...
+        C.g_arena.restore(mark0)
+        ...
+        agree = LOGB * (Lp - diff.len)
+        if 2 * agree >= p + 30:
+            break
+        ...
+        K = F.big_mul(A, Bv)
+        Bn, yn = NW.rsqrt_ramp_cu(K, y, agree - 9 if agree > 9 else 0, nsteps)
+        A = C.keep_into(slotA, A2, slot_cap)
+        Bv = C.keep_into(slotB, Bn, slot_cap)
+        T = C.keep_into(slotT, Tn, slot_cap)
+    ...</code></pre>
+<h2 id="c9">9. Newton's Two Weapons: Precision Ramping and Warm Starts</h2>
+<p>If Newton's square root ran only once, any implementation would do; but AGM invokes it every round — 27 times in all, counting initialization. If every Newton step multiplied at full precision, one square root would cost ≈ 23 full-size big multiplications, and 27 square roots ≈ 600-odd — enough to swallow everything the better algorithm had saved. Two standard weapons:</p>
+<h3>9.1 Precision ramping</h3>
+<p>At Newton step k, only about 2<sup>k</sup> digits are correct — so don't waste work at full precision! Split the precision into levels (the limb count doubling per level), seed the lowest level exactly with Python big integers (<code>math.isqrt</code>), then climb level by level: each level takes only the top m limbs of K into the computation, and one Newton step pushes the correct digit count from "half a level" to "a full level" exactly. Because each level costs twice as much as the one before, the total cost is ≈ 2× the last level alone — <b>one square root ≈ a constant number of full-size multiplications</b>.</p>
+<h3>9.2 Warm starts</h3>
+<p>Across two adjacent rounds, the high digits of K = aₙbₙ are nearly identical (by round n they already agree to ~2<sup>n</sup> digits), and we keep Newton's intermediate quantity y ≈ 1/√K around anyway — so feed the previous round's y in directly as the seed and skip most of the ramp levels. The last level still iterates until the correction reaches zero, which makes it naturally self-correcting: even if the warm start was too optimistic, it merely costs an extra step or two and can never produce a wrong answer. There is also one small but exact finishing touch: once the correction is shorter than half the length of y, quadratic convergence guarantees the next correction is below 1 ulp — <b>the confirmation step can be skipped outright</b>. This one trick cuts the total Newton steps from 479 to 443 and the big multiplications from 1145 to 1062:</p>
+<pre class="code"><code># Excerpt from pi-numba/newton.py — rsqrt_ramp_cu: precision ramping + warm-start level-skipping + the confirmation-free step
+    levels = ramp_levels(dk, True, 4)
+    ...
+    if warm is not None and warm.len > 0 and warm_digits >= 36:
+        ...
+        if cand >= 0:
+            start = cand
+            m0 = levels[start]
+            y0 = big_shr(warm, (dk - m0) // 2) if m0 &lt; dk else warm
+            y = keep_into(yslot, y0, yslot_cap)
+    ...
+    for idx in range(start, len(levels)):
+        m = levels[idx]
+        ...
+        for _ in range(max_steps):
+            ...
+            delta = big_half(semantic_mul_shr(y, rr, 2 * hm, "rsqrt_y_rr"))
+            ...
+            if delta.len * 2 &lt; y.len:
+                break
+    s = strip(semantic_mul_shr(K, y, h, "rsqrt_K_y"))
+    return s, y</code></pre>
+<p>The payoff shows up directly in the per-round timings (all 26 AGM rounds listed):</p>
+<table><tr><th>Round</th><td class="num">1</td><td class="num">2</td><td class="num">3</td><td class="num">4</td><td class="num">5</td><td class="num">6</td><td class="num">7</td><td class="num">8</td><td class="num">9</td><td class="num">10</td><td class="num">11</td><td class="num">12</td><td class="num">13</td></tr><tr><th>Time (s)</th><td class="num">0.220</td><td class="num">0.218</td><td class="num">0.217</td><td class="num">0.217</td><td class="num">0.217</td><td class="num">0.217</td><td class="num">0.210</td><td class="num">0.208</td><td class="num">0.205</td><td class="num">0.203</td><td class="num">0.200</td><td class="num">0.197</td><td class="num">0.194</td></tr></table>
+<table><tr><th>Round</th><td class="num">14</td><td class="num">15</td><td class="num">16</td><td class="num">17</td><td class="num">18</td><td class="num">19</td><td class="num">20</td><td class="num">21</td><td class="num">22</td><td class="num">23</td><td class="num">24</td><td class="num">25</td><td class="num">26</td></tr><tr><th>Time (s)</th><td class="num">0.191</td><td class="num">0.188</td><td class="num">0.184</td><td class="num">0.180</td><td class="num">0.177</td><td class="num">0.173</td><td class="num">0.169</td><td class="num">0.165</td><td class="num">0.160</td><td class="num">0.156</td><td class="num">0.152</td><td class="num">0.146</td><td class="num">0.137</td></tr></table>
+<p>Each round takes 0.14–0.22 s, gliding smoothly from 0.220 down to 0.137 — the warm-start seed grows ever more accurate as the count of agreeing digits climbs, so fewer and fewer ramp levels are needed. More importantly, there is no warm-up bump and no first-round spike: the JIT bill is paid in full during pre-warming. This "no startup tax" curve will take the stand again in Section 14, when we settle Python's launch tax.</p>
+<h2 id="c10">10. A 2048-Point FFT Inside One Thread Block</h2>
+<p>This is where the star of the show takes the stage. Let's start by formally serving the "recipe" we sampled back in Section 3: everything cuFFTDx needs configured — how big the transform, what precision, forward or inverse, how many batches per block, execution at block level — is, in nvmath-python, just a table of keyword arguments, and one ordinary Python function call assembles them into an FFT <b>descriptor</b>. Every FFT recipe in the whole project is cooked up by the same little factory:</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — the "recipe" factory: one function call assembles the ingredients, returns an FFT descriptor
+from nvmath.device import FFT as DxFFT
+
+def _dx(size, inv, fpb, ept=None):
+    kw = dict(fft_type="c2c", size=size, precision=np.float64,   # ingredients: complex transform, size, fp64
+              direction=("inverse" if inv else "forward"),        # forward / inverse
+              ffts_per_block=fpb, execution="Block")              # batches per block, block-level execution
+    if ept is not None:
+        kw["elements_per_thread"] = ept                           # leave unset and the library picks the optimum
+    return DxFFT(**kw)                                            # ← one recipe; launches no kernel</code></pre>
+<p>The biggest difference from the old "build a plan, then place a phone call" model: this descriptor does nothing on your behalf — it is a <b>recipe</b>. Construction happens at Python run time, but the moment it lands in your hands, the recipe tells you everything about how the kitchen should be set up: <code>storage_size</code> is how many register slots each thread must reserve, <code>elements_per_thread</code> / <code>stride</code> are the pass count and interleave stride of the load loop, <code>value_type</code> is the element type of the register and shared-memory arrays, and <code>block_dim</code> / <code>shared_memory_size</code> are the block shape and workspace size at launch. These traits are captured by closure into the CUDA kernel as Python constants — the moment Numba compiles, they all fold into constants, and the generated machine code is no different from hard-coding the numbers. The "recipe first, kitchen follows the recipe" idea is unchanged; only the act of assembling the recipe now happens at construction time:</p>
+<figure><svg viewBox="0 0 860 268" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah6p" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">The "construction-time recipe": kwargs pick the ingredients; the traits lay out the kitchen</text>
+<rect x="26" y="38" width="110" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="81" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">fft_type="c2c"</text><rect x="144" y="38" width="80" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="184" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">size=2048</text><rect x="232" y="38" width="160" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="312" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">precision=np.float64</text>
+<rect x="400" y="38" width="146" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="473" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">direction="forward"</text><rect x="554" y="38" width="126" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="617" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">ffts_per_block=1</text><rect x="688" y="38" width="132" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="754" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">execution="Block"</text>
+<line x1="430" y1="76" x2="430" y2="96" stroke="#666" marker-end="url(#ah6p)"/>
+<rect x="220" y="100" width="420" height="40" rx="6" fill="#eaf6ec" stroke="#1c7c3c"/><text x="430" y="117" text-anchor="middle" font-family="monospace">fft = DxFFT(**kw)</text><text x="430" y="133" text-anchor="middle" font-size="11" fill="#5b6b7b">nvmath.device.FFT descriptor — built at Python run time, launches no kernel</text>
+<line x1="430" y1="140" x2="160" y2="168" stroke="#666" marker-end="url(#ah6p)"/><line x1="430" y1="140" x2="430" y2="168" stroke="#666" marker-end="url(#ah6p)"/><line x1="430" y1="140" x2="700" y2="168" stroke="#666" marker-end="url(#ah6p)"/>
+<rect x="40" y="172" width="240" height="54" rx="6" fill="#eef3fa" stroke="#666"/><text x="160" y="192" text-anchor="middle" font-family="monospace" font-size="11.5">storage_size · value_type</text><text x="160" y="212" text-anchor="middle" font-size="11" fill="#5b6b7b">per-thread register array rd: length, type</text><rect x="310" y="172" width="240" height="54" rx="6" fill="#eef3fa" stroke="#666"/><text x="430" y="192" text-anchor="middle" font-family="monospace" font-size="11.5">elements_per_thread · stride</text><text x="430" y="212" text-anchor="middle" font-size="11" fill="#5b6b7b">passes and stride of load/write-back loops</text><rect x="580" y="172" width="240" height="54" rx="6" fill="#eef3fa" stroke="#666"/><text x="700" y="192" text-anchor="middle" font-family="monospace" font-size="11.5">block_dim · shared_memory_size</text><text x="700" y="212" text-anchor="middle" font-size="11" fill="#5b6b7b">launch: block shape, shared-mem workspace</text>
+<text x="430" y="254" text-anchor="middle" font-size="12.5" fill="#222">traits are closure-captured into the CUDA kernel as Python constants — folded at compile time, no run-time query in the machine code</text>
+</svg><figcaption>Figure 6: The "construction-time recipe". The ingredients become keyword arguments, and one function call assembles the descriptor; the traits the descriptor exports tell you, in turn, how big a kitchen to open — registers, loop shape, block shape, and shared memory are all derived from the recipe, and once inside the kernel they are all constants.</figcaption></figure>
+<p>The right way to write the kernel, then, is as a <b>factory function</b>: construct the descriptor and read out its traits first, then define the CUDA kernel inside the function body and let the closure weld those constants in. Below is this project's P-level kernel B — each thread block handles one row's 2048-point fp64 complex FFT, and the load/write-back phases multiply in the four-step method's outer twiddles in passing (why we multiply, and by what angles, is unpacked in Section 11):</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — kernel B (P level): one row of 2048-pt FFT per block + outer twiddles
+def make_stageB(inv):
+    fft = _dx(FFT_P, inv, 1)                    # FFT_P = 2048, 1 batch per block
+    st, ept, stride = fft.storage_size, fft.elements_per_thread, fft.stride
+    vt = fft.value_type
+    IS_INV = inv                                # ↑ read the traits: closure-captured, folded to constants at compile time
+
+    @cuda.jit
+    def k_stageB(data, N, rowStride):
+        rd = cuda.local.array(shape=(st,), dtype=vt)   # the data lives in your registers
+        sm = cuda.shared.array(shape=(0,), dtype=vt)   # dynamic shared memory: the library's workspace
+        j = cuda.blockIdx.x                            # this block handles row j
+        base = cuda.blockIdx.y * rowStride + j * FFT_P
+        invN2 = 2.0 / N
+        for i in range(ept):                           # load phase: a loop you wrote
+            e = cuda.threadIdx.x + i * stride
+            if e &lt; FFT_P:
+                v = data[base + e]
+                if IS_INV:
+                    sn, cs = libdevice.sincospi((j * e) * invN2)
+                    v = v * complex(cs, sn)            # inverse: multiply the twiddle in passing on load
+                rd[i] = v
+        fft.execute(rd, sm)                            # ← the library, right here: a 2048-pt FFT in one line
+        for i in range(ept):                           # write-back phase: also a loop you wrote
+            e = cuda.threadIdx.x + i * stride
+            if e &lt; FFT_P:
+                v = rd[i]
+                if not IS_INV:
+                    sn, cs = libdevice.sincospi(-(j * e) * invN2)
+                    v = v * complex(cs, sn)            # forward: multiply the twiddle in passing on write-back
+                data[base + e] = v
+
+    return k_stageB, fft                               # hand the kernel and the recipe to the launcher together</code></pre>
+<p>A few details worth pausing over: <b>the load shape is a registration form set by the library</b> — each thread owns <code>ept</code> elements, interleaved with its peers at <code>stride</code> (<code>e = threadIdx.x + i·stride</code>); load and write-back must copy this form verbatim or <code>execute</code> won't honor it (<code>if e &lt; FFT_P</code> is a general guardrail against ept·stride running past the end of the row under some configurations); <b><code>fft.execute(rd, sm)</code> is one line</b> — a block-level device-side call compiled into your kernel, launching no new kernel: the 2048-point butterflies finish in place in shared memory and the result returns to the registers <code>rd</code>; <b>the direction fork vanishes inside the factory</b> — <code>IS_INV</code> is a closure constant: the forward and inverse kernels compile separately, and the machine code holds not a single run-time branch:</p>
+<figure><svg viewBox="0 0 860 258" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah7p" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">Inside kernel B: one row of 2048-pt fp64 complex FFT, in place in one thread block</text>
+<rect x="20" y="44" width="168" height="104" rx="6" fill="#eef3fa" stroke="#666"/><text x="104" y="64" text-anchor="middle">Global mem: row j</text><text x="104" y="84" text-anchor="middle">2048 complex nums</text><text x="104" y="106" text-anchor="middle" font-family="monospace" font-size="11">base = by·rowStride</text><text x="104" y="121" text-anchor="middle" font-family="monospace" font-size="11">+ j·2048</text><text x="104" y="140" text-anchor="middle" font-size="11" fill="#5b6b7b">grid (Q, R): one row/block</text>
+<line x1="190" y1="96" x2="232" y2="96" stroke="#666" marker-end="url(#ah7p)"/><text x="211" y="84" text-anchor="middle" font-size="11" fill="#2c5f8f">load</text><text x="211" y="112" text-anchor="middle" font-size="11" fill="#5b6b7b">inv: ×twiddle</text><rect x="234" y="44" width="172" height="104" rx="6" fill="#eaf6ec" stroke="#666"/><text x="320" y="64" text-anchor="middle">Registers (per thread)</text><text x="320" y="86" text-anchor="middle" font-family="monospace" font-size="11">rd = local.array(st)</text><text x="320" y="106" text-anchor="middle" font-family="monospace" font-size="11">e = tx + i·stride</text><text x="320" y="128" text-anchor="middle" font-size="11" fill="#5b6b7b">ept/thread, strided</text>
+<line x1="408" y1="96" x2="450" y2="96" stroke="#666" marker-end="url(#ah7p)"/><rect x="452" y="44" width="196" height="104" rx="6" fill="#fdeeee" stroke="#666"/><text x="550" y="64" text-anchor="middle" font-family="monospace" font-size="11.5">fft.execute(rd, sm)</text><text x="550" y="86" text-anchor="middle">2048-pt butterflies in place</text><text x="550" y="106" text-anchor="middle" font-size="11">sm: dyn. shared-mem workspace</text><text x="550" y="122" text-anchor="middle" font-size="11" fill="#5b6b7b">shared_memory_size bytes</text><text x="550" y="138" text-anchor="middle" font-size="11" fill="#5b6b7b">result back in registers rd</text>
+<line x1="650" y1="96" x2="692" y2="96" stroke="#666" marker-end="url(#ah7p)"/><text x="671" y="84" text-anchor="middle" font-size="11" fill="#2c5f8f">write-back</text><text x="671" y="112" text-anchor="middle" font-size="11" fill="#5b6b7b">fwd: ×twiddle</text><rect x="694" y="44" width="146" height="104" rx="6" fill="#faf0e6" stroke="#666"/><text x="767" y="68" text-anchor="middle">Global mem: same row</text><text x="767" y="92" text-anchor="middle">overwritten in place</text><text x="767" y="118" text-anchor="middle" font-size="11" fill="#5b6b7b">one round-trip total</text>
+<text x="430" y="176" text-anchor="middle" font-size="11.5" fill="#222">The 2048 points are dealt out strided — thread t handles e = t, t+stride, t+2·stride, …</text><rect x="60" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="92" y="203" text-anchor="middle" font-family="monospace" font-size="11">t0</text><rect x="128" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="160" y="203" text-anchor="middle" font-family="monospace" font-size="11">t1</text><rect x="196" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="228" y="203" text-anchor="middle" font-family="monospace" font-size="11">t2</text><rect x="264" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="296" y="203" text-anchor="middle" font-family="monospace" font-size="11">⋯</text><rect x="332" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="364" y="203" text-anchor="middle" font-family="monospace" font-size="11">t(S−1)</text><rect x="400" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="432" y="203" text-anchor="middle" font-family="monospace" font-size="11">t0</text><rect x="468" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="500" y="203" text-anchor="middle" font-family="monospace" font-size="11">t1</text><rect x="536" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="568" y="203" text-anchor="middle" font-family="monospace" font-size="11">t2</text><rect x="604" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="636" y="203" text-anchor="middle" font-family="monospace" font-size="11">⋯</text><rect x="672" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="704" y="203" text-anchor="middle" font-family="monospace" font-size="11">t(S−1)</text><text x="775" y="203" font-size="11" fill="#5b6b7b">⋯ ept passes</text>
+<text x="228" y="230" text-anchor="middle" font-size="11" fill="#5b6b7b">Pass 1 (i=0): e = 0 … stride−1</text><text x="568" y="230" text-anchor="middle" font-size="11" fill="#5b6b7b">Pass 2 (i=1): e = stride … 2·stride−1</text><text x="430" y="250" text-anchor="middle" font-size="11.5" fill="#5b6b7b">Block shape and shared mem come from the recipe (fft.block_dim / fft.shared_memory_size); probe.py pinned ept=8 to verify: 256 threads × 8 complex each</text>
+</svg><figcaption>Figure 7: kernel B data flow. The load phase reads one row of 2048 points, strided, into each thread's registers (the inverse transform multiplies twiddles in passing), fft.execute completes the in-block butterflies using shared memory, and the write-back phase (the forward transform multiplies twiddles in passing) overwrites in place — one thread block and one round trip to global memory for the whole job.</figcaption></figure>
+<p><b>Twiddle precision</b> demands the same rigor: every phase here has a power-of-2 denominator — <code>invN2 = 2.0/N</code> is exact in binary, <code>j·e</code> is an integer no larger than 2<sup>22</sup>, and their product loses not a single bit; <code>libdevice.sincospi</code> comes with exact π reduction and delivers sine and cosine in one call (the Python side unpacks them straight into <code>sn, cs</code>, then finishes the rotation with <code>v * complex(cs, sn)</code>), so each twiddle carries an error of ≤1 ulp — no lookup tables, no accumulation, computed on the spot. This "cheap rigor" is the least worrisome line item in Section 6's 0.25 red-line budget.</p>
+<p>The final step: the recipe turns around and tells you how big a kitchen to open — you compute none of the launch parameters yourself; take them exactly as written:</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — launch: grid (Q, R), one row per block; block shape and shared memory copied straight from the recipe
+def run_stageB(buf, inv, Q, N, R=1, rowStride=0):
+    k, fft = _get(("B", inv), lambda: make_stageB(inv))      # factory output cached: build each configuration only once
+    launch(k, (int(Q), int(R)), fft.block_dim, fft.shared_memory_size, buf, float(N), int64(rowStride))</code></pre>
+<div class="callout">The trio of "descriptor factory + trait folding + caching" is the foundation of this article's entire FFT side: the same <code>_dx</code> will keep cooking up recipes — for the Q-point row FFT (kernel D), the R-point outer FFT, and even Section 17's frequency-domain three-in-one with "forward and inverse descriptors in the same pot" — while <code>_get</code> / <code>_kcache</code> guarantee each configuration is compiled exactly once. "Compile once, launch everywhere" will be a key piece of testimony when Section 14 settles Python's launch tax; and whether what we assemble is correct is guarded by Section 19's verification ladder. The single-block ceiling still stands: one thread block holds only a few thousand fp64 complex points, and 100-million-digit π needs 2<sup>28</sup> — the next section stacks this 2048-point building block into a skyscraper.</div>
+<h2 id="c11">11. Beyond One Block: the Four-Step Method, Three-Level Decomposition, and a Spectrum That Is Never Reordered</h2>
+<p>cuFFTDx's ceiling is "whatever fits in one thread block": a few thousand fp64 complex points. But the big multiplication behind 100-million-digit π needs N = 2<sup>28</sup>. The classic answer is the <b>four-step method</b>: view an array of length N = P·Q as a P×Q matrix (n = Q·i + j), and the DFT splits exactly into two rounds of small FFTs sandwiching a pointwise phase:</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>X</mi><mo>[</mo><msub><mi>k</mi><mi>i</mi></msub><mo>+</mo><mi>P</mi><msub><mi>k</mi><mi>j</mi></msub><mo>]</mo><mo>=</mo><munder><mo>&#8721;</mo><mi>j</mi></munder><msubsup><mi>W</mi><mi>Q</mi><mrow><mi>j</mi><msub><mi>k</mi><mi>j</mi></msub></mrow></msubsup><mo>&#8901;</mo><msubsup><mi>W</mi><mi>N</mi><mrow><mi>j</mi><msub><mi>k</mi><mi>i</mi></msub></mrow></msubsup><mo>&#8901;</mo><mrow><mo>(</mo><munder><mo>&#8721;</mo><mi>i</mi></munder><mi>x</mi><mo>[</mo><mi>Q</mi><mi>i</mi><mo>+</mo><mi>j</mi><mo>]</mo><msubsup><mi>W</mi><mi>P</mi><mrow><mi>i</mi><msub><mi>k</mi><mi>i</mi></msub></mrow></msubsup><mo>)</mo></mrow></mrow></math></div>
+<figure><svg viewBox="0 0 860 250" role="img"><defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs><text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">Four-step method: an N=P·Q FFT as two rounds of per-row small FFTs + two transposes</text><rect x="20" y="60" width="130" height="130" rx="6" fill="#eef3fa" stroke="#666"/><text x="85" y="75" font-size="12" text-anchor="middle" fill="#222">Input (natural)</text><text x="85" y="125" font-size="12" text-anchor="middle" fill="#222">P×Q matrix</text><text x="85" y="145" font-size="11" text-anchor="middle" fill="#222">n = Q·i + j</text><line x1="152" y1="125" x2="195" y2="125" stroke="#666" marker-end="url(#ah)"/><text x="173" y="112" font-size="11" text-anchor="middle" fill="#222">transp.</text><rect x="197" y="60" width="160" height="130" rx="6" fill="#eaf6ec" stroke="#666"/><text x="277" y="75" font-size="12" text-anchor="middle" fill="#222">kernel B (one block/row)</text><text x="277" y="125" font-size="12" text-anchor="middle" fill="#222">Q rows × 2048-pt FFT</text><text x="277" y="145" font-size="11" text-anchor="middle" fill="#222">cuFFTDx</text><text x="277" y="165" font-size="11" text-anchor="middle" fill="#222">+ outer twiddle</text><line x1="359" y1="125" x2="402" y2="125" stroke="#666" marker-end="url(#ah)"/><text x="380" y="112" font-size="11" text-anchor="middle" fill="#222">transp.</text><rect x="404" y="60" width="150" height="130" rx="6" fill="#eef3fa" stroke="#666"/><text x="479" y="75" font-size="12" text-anchor="middle" fill="#222">kernel D</text><text x="479" y="125" font-size="12" text-anchor="middle" fill="#222">2048 rows × Q-pt FFT</text><text x="479" y="145" font-size="11" text-anchor="middle" fill="#222">cuFFTDx</text><line x1="556" y1="125" x2="599" y2="125" stroke="#666" marker-end="url(#ah)"/><rect x="601" y="60" width="130" height="130" rx="6" fill="#faf0e6" stroke="#666"/><text x="666" y="75" font-size="12" text-anchor="middle" fill="#222">Spectrum (σ order)</text><text x="666" y="125" font-size="12" text-anchor="middle" fill="#222">seat-blind multiply</text><text x="666" y="145" font-size="11" text-anchor="middle" fill="#222">never reordered!</text><text x="430" y="225" font-size="12" text-anchor="middle" fill="#222">Inverse = exact mirror (D′ → transp. → B′ → transp.); σ order cancels between the two passes</text></svg><figcaption>Figure 8: Four-step data flow. P is fixed at 2048 (kernel B), Q = N/2048 ∈ {4…2048}, covering N ≤ 2<sup>22</sup>.</figcaption></figure>
+<p>When N grows past that, treat the "inner 2<sup>22</sup>" as a new building block and split one more level — <b>three-level decomposition</b> N = 2<sup>22</sup> × R (R ≤ 64), covering up to 2<sup>28</sup>:</p>
+<figure><svg viewBox="0 0 860 240" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">Three-level decomposition: 2^28 = R × 2^22 = R × (2048 × 2048), each level "one small FFT per row"</text>
+<rect x="30" y="40" width="800" height="60" rx="8" fill="#eef3fa" stroke="#666"/>
+<text x="120" y="65" font-size="13">R level (outer)</text><text x="120" y="84" fill="#5b6b7b" font-size="11">R ≤ 64-pt FFT</text>
+<text x="520" y="65" font-family="monospace">k_stageR_fused: R-pt FFT × 2^22 (cuFFTDx)</text>
+<text x="520" y="84" fill="#5b6b7b" font-size="11">+ outer-twiddle transpose (fused into load, §15)</text>
+<rect x="30" y="112" width="800" height="60" rx="8" fill="#eaf6ec" stroke="#666"/>
+<text x="120" y="137" font-size="13">D level (middle)</text><text x="120" y="156" fill="#5b6b7b" font-size="11">Q = 2048-pt FFT</text>
+<text x="520" y="137" font-family="monospace">k_stageD: 2048-pt FFT × R·2048 rows (cuFFTDx)</text>
+<text x="520" y="156" fill="#5b6b7b" font-size="11">R rows batched in one launch (blockIdx.y/z)</text>
+<rect x="30" y="184" width="800" height="48" rx="8" fill="#fdeeee" stroke="#666"/>
+<text x="120" y="205" font-size="13">B level (inner)</text><text x="120" y="222" fill="#5b6b7b" font-size="11">P = 2048-pt FFT</text>
+<text x="520" y="205" font-family="monospace">k_stageB: 2048-pt FFT (cuFFTDx)</text>
+<text x="520" y="222" fill="#5b6b7b" font-size="11">the star of §10: done in place in one thread block</text>
+</svg><figcaption>Figure 9: Three-level decomposition. Every level is "one small FFT per row": contiguous within a row, independent across rows — exactly the shape of a thread block.</figcaption></figure>
+<p>Here lies a design choice that saved enormous effort: the frequency order kernel B emits is naturally "scrambled" (a digit-reversed mixed order). The textbook fix is an extra full-array reordering pass to restore natural order — but our FFT serves only convolution: right after the forward transform comes the pointwise multiply, then immediately the inverse transform. <b>The pointwise multiply never looks at seat numbers</b>: as long as the forward and inverse transforms use the same scrambled order σ, the two spectra line up element by element, and who sits in which seat simply does not matter — like two audiences seated by the same shuffled seating chart: the pairing stays perfectly intact. So not a single reordering pass is needed, and the inverse transform is a strict mirror of the forward one. The only place that has to "consult the seating chart" is 2-for-1 unpacking (Section 12), which must find the conjugate partner σ(N−k); for that we keep a pair of cheap mapping functions:</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — the scrambled spectrum's "seating chart": bidirectional map, storage order σ ↔ true frequency k
+@cuda.jit(device=True)
+def ki_of_s(s, Qin):
+    pos = s // Qin
+    kq = s - pos * Qin
+    return pos + 2048 * kq
+
+@cuda.jit(device=True)
+def sigma_of_k(k, M, R, Qin):
+    kb = k // M
+    ka = k - kb * M
+    kq = ka >> 11
+    r = ka &amp; 2047
+    return (r * Qin + kq) * R + kb</code></pre>
+<p>Engineering throws in one more small perk, a "factory + cache": Q and R are values known only at run time, while the recipe is a construction-time constant — so look up the cache once per spec, and each of the dozen or so Sizes specializes into its own dedicated kernel, with Numba compiling and optimizing every one of them separately:</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — run-time sizes go straight into the descriptor: nvmath compiles dedicated FFTs on demand, and the factory caches by key
+def _dx(size, inv, fpb, ept=None):
+    kw = dict(fft_type="c2c", size=size, precision=np.float64,
+              direction=("inverse" if inv else "forward"),
+              ffts_per_block=fpb, execution="Block")
+    if ept is not None:
+        kw["elements_per_thread"] = ept
+    return DxFFT(**kw)
+
+_kcache = {}
+
+def _get(key, builder):
+    k = _kcache.get(key)
+    if k is None:
+        k = builder()
+        _kcache[key] = k
+    return k</code></pre>
+<p>At this point the full pipeline is up and running: load, three-level forward transform, pointwise multiply, three-level inverse transform, rounding, carry — one kernel (or a few) per step, the logic clear, selftest all green, all 100 million digits correct digit by digit. But "computing it right" is still a long way from "computing it fast": this is the other face of Section 3's line that "once the contract is torn up, nobody has your back" — you have won your freedom, but every pass over device memory, every launch, and every atomic operation is now <b>your own</b> problem. Hand this pipeline to a profiler, and an unexpected bill appears. The next three sections are the complete record of working through that bill, item by item.</p>
+<h2 id="c12">12. Move Fewer Bytes: 2-for-1 Packing and Load Fusion</h2>
+<p>Hand this pipeline to the profiler, and the biggest item on the first bill is sheer <b>GPU memory traffic</b>. This batch of changes is all about "move fewer bytes": <b>① load/twiddle fusion</b> — the limb→complex load is folded into the first transpose, and the outer twiddles into the wide transpose (a first small taste of the fusion idea; the deep end comes in Section 15); <b>② 2-for-1 real packing</b> — our inputs are all real sequences, and one complex FFT naturally has room for two real arrays:</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>A</mi><mo>(</mo><mi>k</mi><mo>)</mo><mo>=</mo><mfrac><mrow><mi>Z</mi><mo>(</mo><mi>k</mi><mo>)</mo><mo>+</mo><mover><mi>Z</mi><mo>&#175;</mo></mover><mo>(</mo><mi>N</mi><mo>&#8722;</mo><mi>k</mi><mo>)</mo></mrow><mn>2</mn></mfrac><mo>,&#x2003;</mo><mi>B</mi><mo>(</mo><mi>k</mi><mo>)</mo><mo>=</mo><mfrac><mrow><mi>Z</mi><mo>(</mo><mi>k</mi><mo>)</mo><mo>&#8722;</mo><mover><mi>Z</mi><mo>&#175;</mo></mover><mo>(</mo><mi>N</mi><mo>&#8722;</mo><mi>k</mi><mo>)</mo></mrow><mrow><mn>2</mn><mi>i</mi></mrow></mfrac></mrow></math></div>
+<figure><svg viewBox="0 0 860 170" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah2f" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">2-for-1: one complex FFT, two real-sequence spectra at once</text>
+<rect x="20" y="46" width="130" height="34" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="85" y="67" text-anchor="middle">real array a</text>
+<rect x="20" y="96" width="130" height="34" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="85" y="117" text-anchor="middle">real array b</text>
+<line x1="152" y1="63" x2="205" y2="80" stroke="#666" marker-end="url(#ah2f)"/>
+<line x1="152" y1="113" x2="205" y2="94" stroke="#666" marker-end="url(#ah2f)"/>
+<rect x="208" y="70" width="150" height="36" rx="6" fill="#eaf6ec" stroke="#666"/><text x="283" y="92" text-anchor="middle" font-family="monospace">z = a + i·b</text>
+<line x1="360" y1="88" x2="410" y2="88" stroke="#666" marker-end="url(#ah2f)"/><text x="385" y="78" text-anchor="middle" fill="#2c5f8f">one FFT</text>
+<rect x="412" y="70" width="110" height="36" rx="6" fill="#fdeeee" stroke="#666"/><text x="467" y="92" text-anchor="middle" font-family="monospace">Spectrum Z(k)</text>
+<line x1="524" y1="88" x2="574" y2="88" stroke="#666" marker-end="url(#ah2f)"/><text x="549" y="78" text-anchor="middle" fill="#2c5f8f">unpack</text>
+<rect x="576" y="40" width="260" height="42" rx="6" fill="#fff" stroke="#666"/>
+<text x="706" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">A(k) = (Z(k)+Z̄(N−k))/2</text>
+<text x="706" y="75" text-anchor="middle" fill="#5b6b7b" font-size="11">spectrum of a</text>
+<rect x="576" y="94" width="260" height="42" rx="6" fill="#fff" stroke="#666"/>
+<text x="706" y="112" text-anchor="middle" font-family="monospace" font-size="11.5">B(k) = (Z(k)−Z̄(N−k))/2i</text>
+<text x="706" y="129" text-anchor="middle" fill="#5b6b7b" font-size="11">spectrum of b</text>
+<text x="430" y="160" text-anchor="middle" fill="#5b6b7b" font-size="11.5">Unpacking and the pointwise multiply A(k)·B(k) share one kernel (k_pw_2for1); forward transforms drop from 2 to 1</text>
+</svg><figcaption>Figure 10: 2-for-1. The forward-transform count for multiplying two distinct numbers (x·y, as opposed to the square x²) drops from 2 to 1, and unpacking and the pointwise multiply share a single kernel.</figcaption></figure>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — k_pw_2for1: frequency-domain unpack + pointwise multiply in one kernel (iterating in σ-major order)
+@cuda.jit
+def k_pw_2for1(Z, N, M, R, Qin, invN):
+    ...
+    while s1 &lt; N:
+        kb = s1 % R
+        sa = s1 // R
+        k = ki_of_s(sa, Qin) + M * kb
+        if k &lt;= half:
+            ...
+                s2 = sigma_of_k(N - k, M, R, Qin)
+                z1 = Z[s1]
+                z2 = Z[s2]
+                ax = 0.5 * (z1.real + z2.real)
+                ay = 0.5 * (z1.imag - z2.imag)
+                bx = 0.5 * (z1.imag + z2.imag)
+                by = 0.5 * (z2.real - z1.real)
+                px = (ax * bx - ay * by) * invN
+                py = (ax * by + ay * bx) * invN
+                Z[s1] = complex(px, py)
+                Z[s2] = complex(px, -py)
+        s1 += stride</code></pre>
+<p><b>③ Newton's confirmation-free step</b> (mechanism in Section 9): big multiplications across the whole run go from 1145 → 1062 — 7% fewer of the most expensive operation, outright. The three together: byte traffic on the main data path and the forward-transform count are both nearly <b>cut in half</b>, without touching any compute logic.</p>
+<div class="callout"><b>Maxim 1: In a memory-bound pipeline, saving bytes is saving time.</b> 2-for-1 cuts away half the forward transforms in a single stroke; load/twiddle fusion folds the data movement into a road we must travel anyway — and every cut leaves the compute logic untouched.</div>
+<h2 id="c13">13. Fewer Launches, Coalesced Access: Two-Phase Carry and Memory-Access Shape</h2>
+<h3>13.1 Kernel launches cost money too</h3>
+<p>The profiler's next glaring number: a single 100-million-digit run launches <b>over 26,000 kernels</b> (26,011 in the baseline — the "unit price" of each launch is saved for Section 14 to settle in full). Every launch carries a fixed overhead of a few microseconds, and worse, the GPU may sit idle in the gaps between launches. The bulk of the launch count was already held down at porting time by the batched design (the R rows of each FFT level fused into a single launch, spread across blockIdx.y/z); here we walk through the two heavy hitters that took real design work: <b>① two-phase exact carry</b> — pass-by-pass bounded propagation is replaced by two kernels, "in-segment serial exact + cross-segment fix", settling arbitrarily large coefficients clean in one go:</p>
+<pre class="code"><code># Excerpt from pi-numba/common.py — two-phase exact carry: in-segment serial exact + segment-head fix; two kernels settle arbitrarily large coefficients clean
+@cuda.jit
+def k_carry_seg(inp, n, digits, segout):
+    ...
+    q = int64(0)
+    for k in range(CSEG):
+        v = sh[lo + k] + q
+        q = floordiv_b(v)
+        sh[lo + k] = v - q * LIMB_B
+    ...
+        segout[seg] = q
+@cuda.jit
+def k_carry_fix(digits, segout, n, res01):
+    ...
+    c = segout[seg - 1]
+    ...
+    while k &lt; CSEG and c != 0 and i + k &lt; n:
+        v = int64(digits[i + k]) + c
+        c = floordiv_b(v)
+        digits[i + k] = int32(v - c * LIMB_B)
+        k += 1
+    res01[seg] = int32(c)</code></pre>
+<p>The prefix scan that wraps this up is the <b>carry-lookahead</b> foreshadowed in Section 5: the (g, p) semigroup becomes a three-kernel blocked scan — in-block aggregate → cross-block chaining → apply — and a carry/borrow chain of any length is settled clean in log₂n passes of boolean operations, wiping out along the way every host synchronization in the pass-by-pass propagation. This "in-segment exact + lookahead scan" combination is one of the biggest wins of the entire run, and the foundation of Section 18's carry pipeline.</p>
+<p><b>② one-hot implicit operand</b> — the B<sup>g</sup> (a 1 followed by g 0s) that recurs in Newton steps is no longer materialized as an array hundreds of MB in size:</p>
+<pre class="code"><code># Excerpt from pi-numba/common.py — one-hot implicit operand: B^g (a 1 followed by g 0s) is never materialized; compare/subtract generates it on the fly by position
+@cuda.jit
+def k_diff_hi_onehot(x, nx, pos1, n, pos):
+    ...
+    while i &lt; n:
+        xv = x[i] if i &lt; nx else 0
+        yv = 1 if i == pos1 else 0
+        if xv != yv:
+            local = ((i + 1) &lt;&lt; 1) | (1 if xv > yv else 0)
+        i += stride
+    block_max_i64(local, pos, sh)
+
+@cuda.jit
+def k_sub_onehot(x, nx, pos1, n, sign, out):
+    i = cuda.grid(1)
+    stride = cuda.gridsize(1)
+    while i &lt; n:
+        xv = x[i] if i &lt; nx else 0
+        yv = 1 if i == pos1 else 0
+        out[i] = (yv - xv) if sign > 0 else (xv - yv)
+        i += stride</code></pre>
+
+<h3>13.2 Make every byte coalesced</h3>
+<p>With the launch bill now on the table, the profile's focus returns to memory-access <b>shape</b>: for the same byte count, coalesced access (adjacent threads reading adjacent addresses) and scattered access can differ several-fold in bandwidth. The number-one hotspot at this point was precisely the 2-for-1 unpacking kernel — iterating in frequency-k-major order and scattering its accesses by seat number σ, it at one point monopolized nearly a third of the runtime. Switching the iteration variable to σ itself (replacing the reverse lookup of k with the cheap forward map ki_of_s) makes its own accesses purely contiguous, and the conjugate-partner side falls into mirrored contiguous segments as well — the top hotspot stepped down on the spot. Round this off with shared-memory blocking of the scan loads, the T − pₙ·(d²≫p) three-in-one kernel, and other odds and ends.</p>
+
+<div class="callout"><b>Maxim 2: Launch counts and memory-access shape are the other half of the whole-array mindset.</b> Turning loops into whole-array operations is only the beginning; how many launches those operations take, and whether the addresses each thread touches are adjacent, decide how fast they run.</div>
+<h2 id="c14">14. Python's Launch Tax</h2>
+<h3>14.1 The dispatcher: a 40 µs customs office on every launch</h3>
+<p>The previous section counted the <b>number</b> of launches; this section counts their <b>unit price</b>. Numba's kernel object is a dispatcher: every call configures the grid parameters again, redoes type matching down in the C layer, and re-parses <code>__cuda_array_interface__</code> for each cupy array argument — <b>about 40 µs per launch</b> in total. This is a customs office unique to the interpreter's world, levied on top of the GPU-side launch latency. A full run at 1e8 digits fires 23,251 kernel launches, so the tax bill totals <b>on the order of 1 second</b>: the kernels didn't change and the launch count barely moved (Figure 11) — all the money is spent at the Python↔driver border.</p>
+<pre class="code"><code># Excerpt from pi-numba/common.py — thin launch: pre-specialize + direct-wire overloads,
+# skipping the dispatcher's per-call configure/typeof
+def prime(kern, *args):
+    """Lazy specialize + cache; returns a compiled _Kernel ready for direct .launch."""
+    krn = _spec_cache.get(kern)
+    if krn is None:
+        spec = kern.specialize(*args)
+        krn = next(iter(spec.overloads.values()))
+        _spec_cache[kern] = krn
+    return krn
+
+def launch(kern, grid, block, smem, *args):
+    g_cnt.launches += 1
+    args = tuple(_nb_twins.get(id(a), a) for a in args)   # resident buffer → numba twin
+    prime(kern, *args).launch(args, _d3(grid), _d3(block), core_stream0(), smem)</code></pre>
+<p>The countermeasure is not to bypass Numba but to <b>make its slow path run only once</b>: on the first call, <code>prime()</code> specializes and caches the compiled _Kernel; from then on, <code>launch()</code> direct-wires into its <code>.launch</code> entry point, and all three formalities — configure, type matching, argument parsing — are out of the picture. The precondition is written in the source comments: every kernel's call signature stays stable for the whole run (only the dtype/ndim of arena views enter the type, and the scalar side never forks between int and float), with full selftest coverage as the safety net.</p>
+<h3>14.2 Resident twins and pinned readback</h3>
+<p>With the direct wire in place, the costliest step left on the launch path is parsing the CAI for every cupy argument — yet for resident buffers (the FFT workspaces, g_pos, objects that never change for the whole run), that parse yields the same result every time. <code>register_twin()</code> wraps them once as numba device arrays; <code>launch()</code> swaps in the twin by <code>id</code>, takes the fast is_device_memory branch, and CAI parsing drops to zero. The same medicine also cures host readback: <code>read_pos()</code> does an async copy through a preallocated pinned buffer, sparing the temporary allocation on every readback.</p>
+<pre class="code"><code># Excerpt from pi-numba/common.py — one-time twins for resident buffers + pinned readback
+_nb_twins = {}             # id(resident cupy array) -&gt; one-time numba device array
+
+def register_twin(arr):
+    """Module-level resident arrays only (id stable: object persists); twin shares pointer and dtype."""
+    from numba import cuda as _cuda
+    _nb_twins[id(arr)] = _cuda.as_cuda_array(arr, sync=False)
+
+def read_pos():                          # pinned buffer: no per-readback numpy allocation
+    cp.cuda.runtime.memcpyAsync(_pos_pin.ptr, g_pos.data.ptr, 8,
+                                cp.cuda.runtime.memcpyDeviceToHost, 0)
+    cp.cuda.runtime.streamSynchronize(0)
+    return int(_pos_np[0])</code></pre>
+
+<h3>14.3 A negative result, and JIT warm-up: measurement beats reasoning</h3>
+<p>At the top of common.py sit two more environment variables that must be <b>injected before <code>import numba</code></b>: <code>NUMBA_CUDA_ARRAY_INTERFACE_SYNC=0</code> and <code>NUMBA_CUDA_LOW_OCCUPANCY_WARNINGS=0</code> (setdefault style, so explicitly setting them to 1 from outside rolls this back). The former carried high hopes — the whole run uses a single default stream, same-stream work is ordered by nature, so the per-launch CAI stream sync is pure redundancy and in theory every launch could save a slice — but the measured A/B gain was <b>essentially zero</b>. The negative result goes into the text all the same: it proves the real meat is in the dispatcher itself, not in this sync, and it replays "measurement beats reasoning" once more — hypotheses set the priorities, the stopwatch has the final say.</p>
+<p>The last tax is paid only once: within a process, the first run carries JIT compilation of every kernel — 177.5 s of wall clock; hot runs afterwards take only ~5.630 s. The production posture is therefore fixed as "1 warm-up + N production runs", and every timing in this article is taken from hot runs.</p>
+<figure><svg viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12" role="img"><text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">Total kernel launches over 1 full run</text><line x1="70" y1="40" x2="70" y2="205" stroke="#999"/><line x1="70" y1="205" x2="800" y2="205" stroke="#999"/><line x1="66" y1="205" x2="70" y2="205" stroke="#999"/><text x="62" y="209" font-size="11" text-anchor="end" fill="#555">0k</text><line x1="66" y1="150" x2="70" y2="150" stroke="#999"/><text x="62" y="154" font-size="11" text-anchor="end" fill="#555">10k</text><line x1="66" y1="95" x2="70" y2="95" stroke="#999"/><text x="62" y="99" font-size="11" text-anchor="end" fill="#555">20k</text><line x1="66" y1="40" x2="70" y2="40" stroke="#999"/><text x="62" y="44" font-size="11" text-anchor="end" fill="#555">30k</text><rect x="170" y="62" width="90" height="143" rx="3" fill="#2c5f8f"><title>Baseline: 26,011 launches</title></rect><text x="215" y="57" font-size="11" text-anchor="middle" fill="#333">26,011</text><text x="215" y="223" font-size="12" text-anchor="middle" fill="#555">no algorithmic opts</text><rect x="390" y="59" width="90" height="146" rx="3" fill="#2c5f8f"><title>With middle product: 26,563 launches</title></rect><text x="435" y="54" font-size="11" text-anchor="middle" fill="#333">26,563</text><text x="435" y="223" font-size="12" text-anchor="middle" fill="#555">with middle product (§16)</text><rect x="610" y="60" width="90" height="145" rx="3" fill="#2c5f8f"><title>23,251 launches</title></rect><text x="655" y="55" font-size="11" text-anchor="middle" fill="#333">23,251</text><text x="655" y="223" font-size="12" text-anchor="middle" fill="#555">all opts</text><text x="430" y="252" font-size="11.5" text-anchor="middle" fill="#5b6b7b">Bars stay level: not fewer launches, cheaper ones — the ≈40 µs/launch dispatcher fee drops to ~0 (direct launch + twins)</text></svg><figcaption>Figure 11: kernel launch counts stay nearly level across all three stages (over 1 full run). The launch-tax cut comes not from launching less often but from driving down the unit price of each launch.</figcaption></figure>
+<div class="callout"><b>Maxim 3: In the interpreter's world, every border crossing (Python↔driver) has a price — amortize the crossings instead of dreaming of eliminating them.</b> Caching the specialization once, registering the twin once, setting aside one pinned buffer — they are all the same move: depreciating an O(launch count) per-launch formality into a one-time O(1) investment. The launch count barely moved (Figure 11); what moved is the unit price.</div>
+<h2 id="c15">15. Deep Fusion: the Device-Side Library's Exclusive Advantage</h2>
+<p>Up to this point, the middle stretch of every large multiplication is still a chain of a dozen-plus kernels: <b>pure data-movement kernels (transpose / permutation / load / rounding) alternating with compute kernels (FFT / pointwise multiply)</b>, each one a full pass of GPU-memory reads and writes — and at 2<sup>28</sup> points a single pass is 4GB. Now the foreshadowing from Section 3 pays off: since the FFT is a line inside your kernel, the load and write-back phases around it are your code — <b>fold the adjacent data-movement kernels into the compute kernels' load and write-back phases</b>, saving launches and whole passes of bandwidth in one stroke. That verb simply does not exist in the host-call model (there, even "convert a type in passing while loading" has to squeeze through the narrow door of a callback), while in the device-side model it is nothing more than editing a loop in your own kernel. There is exactly one rule for judging whether a fusion is possible: <b>after fusion, one thread block's working set must fit in shared memory</b>. Going down the list:</p>
+<table><tr><th>Fusion point</th><th>Block working set</th><th>Verdict</th></tr><tr><td><b>F2</b>: outer twiddle transpose + R-point FFT (forward and inverse)</td><td class="num">R×32 ≤ 64×32 complex ≈ 34KB</td><td class="pass">feasible</td></tr><tr><td><b>F3</b>: two back-to-back permutations at the inverse-transform tail + rounding + error reduction</td><td class="num">32×32 tile ≈ 16KB</td><td class="pass">feasible</td></tr><tr><td><b>F1</b>: entry load + first permutation</td><td class="num">32×32 tile ≈ 16KB</td><td class="pass">feasible</td></tr><tr><td>row-wise transposes flanking kernel B</td><td class="num">32 rows × 2048 points ≈ 1MB</td><td><b>not feasible</b></td></tr></table>
+<p><b>F2</b> is the biggest piece. Before fusion: the twiddle-transpose kernel writes out 4GB, then the R-point FFT kernel reads those 4GB back in; after fusion the whole thing runs inside one kernel — the twiddle multiply rides for free on a load phase that "had to read the data anyway", the in-block transpose goes through a shared-memory slab (an [R][33] layout, with the extra column there precisely to cure bank conflicts), the FFT executes in place in registers, and the results land in GPU memory directly in σ order:</p>
+<figure><svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ahf" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">F2 before/after: one 8GB memory round trip saved (2^28 pts)</text>
+<text x="20" y="52" fill="#5b6b7b">Before fusion (two kernels):</text>
+<rect x="30" y="64" width="230" height="46" rx="6" fill="#eef3fa" stroke="#666"/>
+<text x="145" y="83" text-anchor="middle" font-family="monospace">k_transpose2_twr</text>
+<text x="145" y="100" text-anchor="middle" fill="#5b6b7b" font-size="11">twiddle + transpose (pure move)</text>
+<rect x="330" y="64" width="200" height="46" rx="6" fill="#faf0e6" stroke="#c07a3a" stroke-width="2"/>
+<text x="430" y="83" text-anchor="middle">mem: 4GB write + 4GB read</text>
+<text x="430" y="100" text-anchor="middle" fill="#c07a3a" font-size="11">≈ 4 ms per large mult.</text>
+<rect x="600" y="64" width="230" height="46" rx="6" fill="#eaf6ec" stroke="#666"/>
+<text x="715" y="83" text-anchor="middle" font-family="monospace">k_stageR</text>
+<text x="715" y="100" text-anchor="middle" fill="#5b6b7b" font-size="11">R-point FFT (compute)</text>
+<line x1="262" y1="87" x2="328" y2="87" stroke="#666" marker-end="url(#ahf)"/>
+<line x1="532" y1="87" x2="598" y2="87" stroke="#666" marker-end="url(#ahf)"/>
+<text x="20" y="160" fill="#5b6b7b">After fusion (one kernel, k_stageR_fused):</text>
+<rect x="30" y="172" width="800" height="100" rx="8" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="2"/>
+<rect x="52" y="190" width="228" height="62" rx="6" fill="#fff" stroke="#666"/>
+<text x="166" y="212" text-anchor="middle">Load: read mem rows</text>
+<text x="166" y="230" text-anchor="middle" fill="#5b6b7b" font-size="11">twiddle in passing</text>
+<text x="166" y="246" text-anchor="middle" fill="#5b6b7b" font-size="11">(read anyway, move comes free)</text>
+<rect x="316" y="190" width="228" height="62" rx="6" fill="#eef4ff" stroke="#666"/>
+<text x="430" y="212" text-anchor="middle">shared-mem slab [R][33]</text>
+<text x="430" y="230" text-anchor="middle" fill="#5b6b7b" font-size="11">transpose (+1 col vs bank conflicts)</text>
+<text x="430" y="246" text-anchor="middle" fill="#5b6b7b" font-size="11">32 cols × R rows ≈ 34KB</text>
+<rect x="580" y="190" width="228" height="62" rx="6" fill="#fdeeee" stroke="#666"/>
+<text x="694" y="212" text-anchor="middle" font-family="monospace">fft.execute</text>
+<text x="694" y="230" text-anchor="middle" fill="#5b6b7b" font-size="11">R-point FFT in registers</text>
+<text x="694" y="246" text-anchor="middle" fill="#5b6b7b" font-size="11">write-back to mem in σ order</text>
+<line x1="282" y1="221" x2="314" y2="221" stroke="#666" marker-end="url(#ahf)"/>
+<line x1="546" y1="221" x2="578" y2="221" stroke="#666" marker-end="url(#ahf)"/>
+<text x="430" y="292" text-anchor="middle" fill="#1c7c3c">Intermediates never land in GPU memory — only writable when the FFT is "a line in your kernel"</text>
+</svg><figcaption>Figure 12: F2 before and after fusion. The middle 8GB round trip through GPU memory (4GB written + 4GB read) disappears entirely.</figcaption></figure>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — F2 fusion (make_stageR_fused, forward branch): twiddle transpose + R-point FFT done in one kernel
+    @cuda.jit
+    def k_stageR_fused(inp, out, M, N, Qin):
+        ...
+        if not IS_INV:
+            idx = tid
+            while idx &lt; Rv * 32:
+                b = idx >> 5
+                sc = idx &amp; 31
+                v = inp[b * M + s0 + sc]
+                sn, cs = libdevice.sincospi(-(b * ki_of_s(s0 + sc, Qin)) * invN2)
+                slab[idx + (idx >> 5)] = v * complex(cs, sn)   # b=0 → angle 0, exact identity
+                idx += nthreads
+            cuda.syncthreads()
+            for i in range(ept):
+                e = cuda.threadIdx.x + i * stride
+                if e &lt; Rv:
+                    rd[i] = slab[e * 33 + sy]
+            cuda.syncthreads()
+            fft.execute(rd, slab)
+            ...
+                    out[(s0 + sy) * Rv + e] = rd[i]</code></pre>
+<p><b>F3</b> handles the tail of the inverse transform, where there used to be two back-to-back pure-transpose kernels plus a rounding kernel (three full passes of reads and writes). The composition of two permutations is still a permutation — work through the index algebra: in[b·M + j·2048 + i] should land at raw[T·i + t] (T = R·Q, t = R·j + b), and as it happens both the read side and the write side can be made coalesced; rounding, together with the 0.25-red-line error reduction, falls naturally into place as the write-out phase:</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — F3 fusion (k_perm_rint): tail permutation + rounding + residual reduction done in one kernel
+@cuda.jit
+def k_perm_rint(inp, M, R, T, m, raw, err):
+    tile = cuda.shared.array((32, 33), dtype=complex128)
+    ...
+    while dt &lt; 32:
+        t = t0 + dt
+        if t &lt; T:
+            b = t % R
+            j = t // R
+            tile[dt][cuda.threadIdx.x] = inp[b * M + j * FFT_P + i0 + cuda.threadIdx.x]
+    ...
+        n = T * (i0 + dy) + t0 + cuda.threadIdx.x
+        if t0 + cuda.threadIdx.x &lt; T and n &lt; m:
+            v = tile[cuda.threadIdx.x][dy]
+            r = libdevice.llrint(v.real)
+            raw[n] = r
+            e = abs(v.real - r)
+            ei = abs(v.imag)
+    ...
+    if tid == 0:
+        cuda.atomic.max(err, 0, libdevice.double_as_longlong(sh[0]))</code></pre>
+<p><b>F1</b> mirrors F3 (the entry load composed with the first permutation), so we will not spell it out. The three batches of changes each landed independently and each climbed the full verification ladder (Section 19) — the identity test at the smallest three-level size, 2<sup>23</sup>, exposes any permutation or twiddle slip within seconds, the "small before large" verification discipline collecting its paycheck for the umpteenth time. Kernel counts for the three-level pipeline: forward transform 7 → 5, inverse transform 8 → 5. The results:</p>
+<p>In this implementation, deep fusion is part of the foundation — it came in with the port itself — and its payoff is written directly into each large multiplication's static kernel ledger: on the three-level path, a non-square multiplication runs 15 kernels end to end, a squaring 13, and the middle-product path 18 — one 100-million-digit run totals 23,251 launches (Figure 11 in Section 14). Without this layer of fusion, every large multiplication would cost several more full round trips through GPU memory — and at 2<sup>28</sup> points a single pass is 4GB.</p>
+<div class="callout"><b>The second most important sentence in this article: when the library's kernel boundaries are walls, you can only optimize between the walls; when the library's kernel boundaries are lines you drew yourself, the whole pipeline is up for optimization.</b> In this pipeline's performance engineering, changes like atomic reductions and byte-saving work under any execution model, but this final stretch of deep fusion — along with the load/twiddle fusion of Section 12 — belongs to the device-side route alone: the bytes before and after <code>fft.execute</code> are yours to manage, and that is what makes the line movable. And, to record the other side of the boundary honestly: the transposes flanking kernel B cannot be fused, and they still claim their share of the remaining time — the size of shared memory is the exact range of this exclusive advantage.</div>
+<p>Let us gather up the list of capabilities this device-side workflow has accumulated: <b>① control over fusion</b> — this entire section, which no host-side library can offer; <b>② zero host overhead</b> — no plans, no handles, no library state machine; the table in Section 9 with per-round times sliding smoothly downward is the testimony; <b>③ single-kernel composition</b> — inside kernel B, the load, the twiddles, the 2048-point FFT, and the write-back hand off to one another in the same block of shared memory (Section 10); <b>④ compile-time specialization</b> — dedicated kernels compiled separately for each configuration, with no runtime branch tax.</p>
+<p>The next three sections will prove that the same methodology — profile first, an identity-test safety net, strict A/B discipline (Section 19) — can keep pushing performance up: first use the exact middle product to cut away three quarters of an FFT (Section 16, a single cut worth −26.1%), then make the carry pipeline in-passing, fused, and sparse (Section 18), and fuse the frequency-domain middle stretch into one kernel (Section 17); together with odds and ends like Section 14's launch-tax cleanup and shared-memory padding.</p>
+<h2 id="c16">16. Compute Only the Slice You Need: the Exact Middle Product</h2>
+<p>The deepest cut of the whole effort goes straight for the biggest block: the big multiplications inside Newton's iteration itself. The clue is not in the kernel but in the hands of the <b>caller</b>. Look back at Sections 7 and 9: many multiplications in a Newton step are right-shifted the moment they are computed —</p>
+<pre class="code"><code>rsqrt_y_rr:      y · rr &gt;&gt; 2hm     // residual correction: only the product's high part
+rsqrt_K_y:       K · y  &gt;&gt; h       // square-root back-substitution
+recip_w_e_ramp:  w · e  &gt;&gt; gm      // reciprocal ramping step
+recip_w_e_final: w · e  &gt;&gt; g       // reciprocal wrap-up</code></pre>
+<p>The full product has mfull = nx+ny−1 limbs, and the right shift throws away the low shift limbs — we pay for an entire 2<sup>28</sup>-point FFT and buy back only the high window of wanted = mfull − shift limbs, <b>less than a quarter of the full price</b>. Section 12 saved bytes on "how to compute"; this section saves on "what to compute": tag every such call site with a semantic label and route them all through a single interface that can fall back —</p>
+<pre class="code"><code># Excerpt from pi-numba/newton.py — semantic_mul_shr: a semantic tag; the caller declares "I only need the product's high part"
+def semantic_mul_shr(a, b, shift, semantic):
+    # the caller declares "high part only"; falls back to a full multiply automatically when the middle-product interval does not collapse
+    return F.big_mul_high_proto(a, b, shift, semantic)
+    ...
+            delta = big_half(semantic_mul_shr(y, rr, 2 * hm, "rsqrt_y_rr"))
+    ...
+    s = strip(semantic_mul_shr(K, y, h, "rsqrt_K_y"))
+    ...
+            delta = strip(semantic_mul_shr(w, e, gm, "recip_w_e_ramp"))
+    ...
+        delta = strip(semantic_mul_shr(w, e, g, "recip_w_e_final"))</code></pre>
+<p>The trick that computes only the high window is a <b>reversal</b>: reverse the high prefix of each operand, and the high window of the original product becomes exactly the <b>low window</b> of the reversed product — and the low window depends only on the convolution of the two short prefixes, so the FFT size drops from Nfull to Nrev. At the 100-million-digit workhorse tier that one drop is worth <b>three levels</b> (2<sup>28</sup> → 2<sup>25</sup>, an FFT roughly 8× cheaper); if the size will not drop (Nrev ≥ Nfull), we fall back to the full multiplication outright — better not to bother than to bother for nothing.</p>
+<figure><svg viewBox="0 0 860 290" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah18" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">middle product: flip the "high window" into a short convolution's "low window"</text>
+<text x="20" y="52" fill="#5b6b7b">Original path: full product, mfull limbs (FFT size Nfull = 2²⁸)</text>
+<rect x="30" y="62" width="560" height="34" rx="4" fill="#eef3fa" stroke="#666"/>
+<rect x="590" y="62" width="240" height="34" rx="4" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="1.5"/>
+<text x="310" y="83" text-anchor="middle" fill="#5b6b7b">low shift limbs — computed only to be discarded by &gt;&gt;</text>
+<text x="710" y="83" text-anchor="middle">high window wanted</text>
+<line x1="430" y1="110" x2="430" y2="146" stroke="#666" marker-end="url(#ah18)"/>
+<text x="446" y="132" fill="#2c5f8f">reverse each operand's high prefix (k_reverse_high)</text>
+<text x="20" y="172" fill="#5b6b7b">New path: short-prefix convolution, mrev limbs (FFT size Nrev = 2²⁵, three levels down)</text>
+<rect x="30" y="182" width="240" height="34" rx="4" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="1.5"/>
+<rect x="270" y="182" width="56" height="34" rx="4" fill="#fdeeee" stroke="#c07a3a" stroke-width="1.5"/>
+<rect x="326" y="182" width="130" height="34" rx="4" fill="#fff" stroke="#999" stroke-dasharray="4 3"/>
+<text x="150" y="203" text-anchor="middle">wanted (reversed to low end)</text>
+<text x="298" y="203" text-anchor="middle" font-size="11">guard</text>
+<text x="391" y="203" text-anchor="middle" fill="#5b6b7b" font-size="11">not needed</text>
+<text x="30" y="248" fill="#333">Carry beyond guard is unknown but bounded: incoming carry ∈ [0, U], U from the coefficient upper bound.</text>
+<text x="30" y="268" fill="#333">Run 0 and U through — <tspan fill="#2c5f8f">both ends cross the guard window</tspan>: same exit carry ⇒ exact per limb; else fall back to the full multiply.</text>
+</svg><figcaption>Figure 13: the middle product's reversal trick and the guard interval. Green is the window actually computed; guard is insurance bought against the "unknown incoming carry," with the coverage (U's digit count) calculated, not guessed.</figcaption></figure>
+<p>The remaining question is <b>exactness</b> — the truncated low limbs can still invade the high window through a long carry chain; Section 5's 999…9 reef is back in a new disguise. The treatment here is this article's best demonstration of the relationship between "fast" and "accurate": <b>instead of leaving a few extra guard limbs out of habit, turn the uncertainty into an interval, then verify that the interval collapses.</b> The unknown incoming carry at the truncation point has a strict upper bound U (derived from the convolution-coefficient upper bound min(nx,ny)·999²; guard is 2 + log<sub>B</sub>U, in practice 5–6 limbs); both ends of the interval [0, U] are pushed through the guard window together, and the truncated result is accepted only if the two ends converge to the same carry value at the window's exit:</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — big_mul_high_proto: the strict truncated-carry interval [0,U] crosses the guard window at both ends; no collapse means fallback
+    cmax = min(nx, ny) * 999 * 999
+    U = (cmax + (LIMB_B - 2)) // (LIMB_B - 1)
+    guard = 2
+    t = U
+    while t:
+        guard += 1
+        t //= LIMB_B
+    ...
+    hg = draw[wanted:wanted + guard].get()          # guard window (host-side interval crossing)
+    qlo, qhi = 0, U
+    for i in range(guard):
+        c = int(hg[guard - 1 - i])
+        qlo = (c + qlo) // LIMB_B
+        qhi = (c + qhi) // LIMB_B
+    if qlo != qhi:
+        _mlog(f"{semantic},nx={nx},ny={ny},shift={shift},guard={guard},used=0,reason=carry_interval,lo={qlo},hi={qhi}")
+        g_cnt.add("middle_fallback")
+        return strip(big_shr(big_mul(x, y), shift))</code></pre>
+<p>So this is an <b>exact</b> middle product, not an approximate high product — every limb matches the full multiplication digit for digit, and the 0.25 red line stays on duty on the shrunken FFT. Over the full 100-million-digit run: 354 windows took the shrunken FFT, while 116 calls fell back safely because the shape was wrong, the size too small, or the interval not unique; the adversarial inputs of all 999s and ultra-long carry chains (Section 19's middlebench) owe their limb-for-limb correctness precisely to that fallback. The single largest gain on the whole ladder comes from an FFT core in which not one line was changed.</p>
+<div class="callout"><b>Maxim 4: The fastest multiplication is the one you never compute.</b> Section 12 saved bytes inside "how to compute"; this section saves an entire FFT inside "what to compute" — first ask the caller which slice it actually needs, then talk about how fast to compute that slice. And the precondition for "computing less" is locking the uncertainty inside a verifiable interval: <b>the window is in charge of fast, the interval is in charge of accurate, and when in doubt, fall back.</b></div>
+<h2 id="c17">17. Fusion All the Way: the Frequency-Domain Three-in-One</h2>
+<p>The second cut returns to the main battlefield of Section 15. Deep fusion folded "data movement" into the load/write-back phases of "compute", but at three-level-decomposition sizes (N &gt; 2<sup>22</sup>) the <b>frequency-domain middle stage</b> still runs as a chain of three launches: a last-level R-point forward FFT (<code>k_stageR_fused</code>, forward direction) → a frequency-domain square or 2-for-1 unpack-multiply (<code>k_pw_sqr</code> / <code>k_pw_2for1</code>) → a first-level R-point inverse FFT. Three kernels, each doing one full pass of global-memory reads and writes over the same batch of data — and at 2<sup>28</sup> points, one pass is 4GB. Measure the working set once more: R ≤ 64, one CTA covers 32 columns, and an entire R×32 slab is only 64×32 complex numbers ≈ 32KB (even the two slabs of the packed path total just 66KB) — <b>Section 15's fusion criterion lights up green</b>. This time the fusion is no longer "movement + compute" but "compute + compute + compute":</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — make_rconv_square: twiddle-multiplied load, forward FFT, frequency-domain square, inverse FFT, write-back — all in one kernel
+    @cuda.jit
+    def k_rconv_square(data, M, N, Qin):
+        slab = cuda.shared.array(0, dtype=vt)          # [Rv][33], reused with the FFT workspace
+        rd = cuda.local.array(shape=(st,), dtype=vt)
+    ...
+        while idx &lt; Rv * 32:
+            b = idx >> 5
+            sc = idx &amp; 31
+            v = data[b * M + s0 + sc]
+            sn, cs = libdevice.sincospi(-(b * ki_of_s(s0 + sc, Qin)) * invN2)
+            slab[idx + (idx >> 5)] = v * complex(cs, sn)
+            idx += nthreads
+    ...
+        fwd.execute(rd, slab)
+    ...
+                z = rd[i]
+                rd[i] = (z * z) * invN     # the vt vector type supports multiply (complex semantics), not .real/.imag
+    ...
+        inv.execute(rd, slab)
+    ...
+            data[b * M + s0 + sc] = v * complex(cs, sn)</code></pre>
+<p>The squaring path falls out naturally; <b>the 2-for-1 multiply path is the hard part</b>: frequency-domain unpacking has to touch the mirror bins at the same time (Section 12's A/B conjugate split), and the mirror bin lands in a <b>different</b> R×32 slab. The fix is to turn the pairing into data: the host pre-generates a table of <b>unique mirror tile-pair descriptors</b> (at the 2<sup>22</sup> inner size, 65,535 pairs in all); an ordinary CTA claims one pair of descriptors by <code>blockIdx.x</code>, loads both mirror slabs together, transforms each, and cross-multiplies them; the self-conjugate bins and the misaligned first tile (the s=0 neighborhood, column Q/2) go to a dedicated CTA on a <code>SPECIAL</code> branch — the branch tax lands on just 1 block, while the remaining 65,535 blocks take the branch-free fast path. The two slabs plus the transform workspace exceed the 48KB default shared-memory cap, so the launch side requests more with an opt-in attribute:</p>
+<pre class="code"><code># Excerpt from pi-numba/fft.py — dispatch_rconv_packed: dynamic shared memory above 48KB must be explicitly unlocked at the driver level
+def dispatch_rconv_packed(R, data, M, N, Qin):
+    # Always take prime + direct-wire (the dispatcher fallback path compiles a separate
+    # cufunc without the >48KB attribute unlocked; at R≥32 its launch fails outright).
+    k, fwd, inv = _get(("rconvP", R), lambda: make_rconv_packed(R))
+    smem = ((max(fwd.shared_memory_size, inv.shared_memory_size) + 15) &amp; ~15) \
+        + 2 * R * 33 * 16
+    args = tuple(C._nb_twins.get(id(a), a)
+                 for a in (data, int64(M), float(N), int64(Qin), g_rconv_pairs, 0))
+    krn = C.prime(k, *args)
+    if R not in _rconv_attr_done:
+        from numba.cuda.cudadrv.driver import driver as _drv
+        from cuda.bindings import driver as _binding
+        cufunc = krn._codelibrary.get_cufunc()
+        _drv.cuKernelSetAttribute(
+            _binding.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem, cufunc.handle, cufunc.device.id)
+        _rconv_attr_done.add(R)
+    npairs = g_rconv_pairs.size // 2
+    ...
+    krn.launch(args, (int(npairs), 1, 1), bd, C.core_stream0(), smem)
+    krn.launch(args[:5] + (1,), (1, 1, 1), bd, C.core_stream0(), smem)</code></pre>
+
+<p>The two cuts — this one and the middle product — are almost perfectly orthogonal: one trims the <b>number</b> of FFTs (what gets computed), the other speeds up the <b>middle stage</b> of every FFT (how it gets computed), and neither encroaches on the other's gains. This is the second paycheck collected on Section 15's rule — and the criterion has never changed: <b>if the working set fits in shared memory, fuse.</b></p>
+<h2 id="c18">18. The Carry Pipeline: In Passing, Fused, and Sparse</h2>
+<p>Once multiplication got cheap, what surfaced on the profiler's leaderboard was the carry chain — the "in-segment exact + lookahead scan" kernels that landed in Section 13. The bytes are all coalesced now; only one problem is left: <b>the number of full-array sweeps</b>. This chapter takes two steps: first get other kernels to do the sweeping work "in passing", then make the sweeps themselves disappear.</p>
+<h3>18.1 strip, done in passing</h3>
+<p>The first step comes from a simple observation: <code>strip()</code> (find the highest nonzero limb) used to be a standalone full-array sweep kernel — yet the carry-apply kernel k_scan_apply <b>has to see every final digit anyway</b>, so why sweep again? Have it record each chunk's highest nonzero position in passing, and all that remains is reducing a few thousand chunk maxima instead of 30-odd million limbs — the standalone strip sweep is out of the game for good.</p>
+<div class="callout"><b>Maxim 5: A kernel that already holds the data should finish, in passing, everything that needs that data.</b> In a memory-bound world, a second full-array sweep is a crime against bandwidth — "in passing" (fusion of concerns) and Section 15's "fusion" (fusion of kernels) are two spellings of the same idea.</div>
+<h3>18.2 Fused and sparse</h3>
+<p>With the in-passing strip in place, the profile shows that multiply normalization (raw int64 FFT coefficients → valid base-1000 digits) is still a volley of five launches, <b>each kernel doing one full read-and-write pass over 30-odd million limbs</b>: k_carry_seg → k_carry_fix → k_scan_agg → k_scan_chunks → k_scan_apply. The memory-access-shape homework is all done (Section 13); the next layer of gains can only come from running fewer passes. The four-step rework that follows is the capstone project of the in-passing principle (Maxim 5):</p>
+<p><b>Step one: fold the cross-segment fix into k_carry_seg.</b> Phase ② (adding the previous segment's outgoing carry into this segment) used to be a separate kernel that read every digit again. Now adjacent segments within a CTA hand their outgoing carries over directly through shared memory; across CTA boundaries there is no inter-block synchronization — so let thread 0 of each block <b>recompute</b> the previous segment's outgoing carry from the raw input, trading a few dozen extra reads for an entire global kernel:</p>
+<pre class="code"><code># Excerpt from pi-numba/common.py — fused in-segment carry: the cross-segment fix folded in; (g,p), Tgp, SegHi all produced in passing
+@cuda.jit
+def k_carry_seg_fused(inp, n, digits, res01, sign, Gc, Pc, Tgp, SegHi):
+    ...
+        if d == (LIMB_B - 1 if sign > 0 else 0):
+            prop_mask |= 1 &lt;&lt; k
+    ...
+    if cuda.threadIdx.x == 0 and seg > 0:
+        ...
+            vb = inp[p1 + k] + qbase
+            qbase = floordiv_b(vb)
+    ...
+    if cuda.threadIdx.x != 0:
+        prev_q = shq[cuda.threadIdx.x - 1]
+    ...
+    if seg &lt; nseg:
+        Tgp[seg] = g | (p &lt;&lt; 1)
+        ...
+        SegHi[seg] = uint8(hi)
+    ...
+        Gc[cuda.blockIdx.x] = G
+        Pc[cuda.blockIdx.x] = P</code></pre>
+<p>k_carry_fix disappears from the multiply-normalization path entirely — taken alone this step lands inside the noise band, but it is the foundation for the two steps that follow.</p>
+<p><b>Step two: compute G/P in passing as well.</b> The (g, p) semigroup of the lookahead scan (Section 13: g = a carry is certainly generated, p = a carry would propagate through) used to be computed by k_scan_agg re-reading the digits — yet at that very moment the digits are lying in k_carry_seg's shared memory. So, in passing: during in-segment normalization, record with a bitmask whether each digit equals 999/0, compute each segment's g/p at segment end, and have thread 0 aggregate the whole chunk's G/P. k_scan_agg is dropped from the multiply path altogether; only addition and subtraction still use it. <b>Step three: never compute the same thing twice.</b> Each segment's g/p is only two bits; pack them into one byte in the Tgp table (about 1 MiB of extra peak memory over the whole run), and the downstream apply just looks it up instead of having every thread walk 32 limbs again.</p>
+<p><b>Step four closes the net: the sparse apply.</b> The key observation: after in-segment exact normalization, <b>the vast majority of segments already hold valid digits and see an incoming carry of 0</b> — yet the generic k_scan_apply, no questions asked, reads every segment in full and writes it back in full. The sparse version processes only the prefix the carry actually touches:</p>
+<pre class="code"><code># Excerpt from pi-numba/common.py — sparse apply: write only the carry-touched prefix; the SegHi invariant preserves strip's exactness
+@cuda.jit
+def k_scan_apply_sparse(s, n, sign, res, Cin, Tgp, SegHi, Hc):
+    ...
+    i0 = seg * CSEG
+    delta = int64(thr_in[cuda.threadIdx.x]) if sign > 0 else -int64(thr_in[cuda.threadIdx.x])
+    if seg > 0 and i0 &lt; n:
+        delta += int64(res[seg - 1])
+    touched = 0
+    changed_hi = 0
+    k = 0
+    while k &lt; CSEG and i0 + k &lt; n and delta != 0:
+        v = int64(s[i0 + k]) + delta
+        delta = floordiv_b(v)
+        d = int32(v - delta * LIMB_B)
+        s[i0 + k] = d
+        touched = k + 1
+        if d != 0:
+            changed_hi = k + 1
+        k += 1
+    old_hi = int(SegHi[seg]) if seg &lt; nseg else 0
+    seg_hi = old_hi if old_hi > touched else changed_hi</code></pre>
+<p>Note the last two lines: strip's exactness (only just folded into the scan in subsection 18.1) was nearly destroyed by sparsification — without reading the whole segment, you cannot know where the highest nonzero digit sits. The insurance policy is <code>SegHi</code>: while normalizing, k_carry_seg uses a bitmask to record each segment's highest nonzero position in passing; after a sparse modification, if the old high mark falls in the untouched suffix it is still exact, and otherwise the <code>changed_hi</code> of the rewritten prefix supplies it. <b>Every "skip" is backed by an invariant.</b></p>
+<figure><svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah20" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">Multiply-normalize path: five full sweeps → fused + sparse</text>
+<text x="20" y="48" fill="#5b6b7b">Before fusion (each kernel: one full DRAM read+write):</text>
+<rect x="30" y="60" width="140" height="48" rx="6" fill="#eef4ff" stroke="#666"/><text x="100" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_carry_seg</text><text x="100" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">exact seg carry</text>
+<rect x="196" y="60" width="140" height="48" rx="6" fill="#eef4ff" stroke="#666"/><text x="266" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_carry_fix</text><text x="266" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">cross-seg fix (reread)</text>
+<rect x="362" y="60" width="140" height="48" rx="6" fill="#eef4ff" stroke="#666"/><text x="432" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_scan_agg</text><text x="432" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">G/P (read again)</text>
+<rect x="528" y="60" width="140" height="48" rx="6" fill="#fff" stroke="#666"/><text x="598" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_scan_chunks</text><text x="598" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">chunk chaining (small)</text>
+<rect x="694" y="60" width="140" height="48" rx="6" fill="#eef4ff" stroke="#666"/><text x="764" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_scan_apply</text><text x="764" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">full read + write</text>
+<line x1="172" y1="84" x2="194" y2="84" stroke="#666" marker-end="url(#ah20)"/><line x1="338" y1="84" x2="360" y2="84" stroke="#666" marker-end="url(#ah20)"/><line x1="504" y1="84" x2="526" y2="84" stroke="#666" marker-end="url(#ah20)"/><line x1="670" y1="84" x2="692" y2="84" stroke="#666" marker-end="url(#ah20)"/>
+<text x="20" y="160" fill="#5b6b7b">After fusion + sparse (one fat kernel produces all metadata, apply sparsified):</text>
+<rect x="30" y="174" width="300" height="96" rx="8" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="2"/>
+<text x="180" y="194" text-anchor="middle" font-family="monospace" font-size="11.5">fused k_carry_seg</text>
+<text x="180" y="212" text-anchor="middle" font-size="11">digit normalization + cross-seg fix (old fix)</text>
+<text x="180" y="229" text-anchor="middle" font-size="11">+ seg/chunk G·P (old agg) + Tgp packing</text>
+<text x="180" y="246" text-anchor="middle" font-size="11">+ SegHi per-seg top nonzero (strip's insurance)</text>
+<text x="180" y="263" text-anchor="middle" fill="#5b6b7b" font-size="11">digits handled once, in shared mem</text>
+<rect x="366" y="198" width="140" height="48" rx="6" fill="#fff" stroke="#666"/><text x="436" y="218" text-anchor="middle" font-family="monospace" font-size="11">k_scan_chunks</text><text x="436" y="235" text-anchor="middle" fill="#5b6b7b" font-size="11">chunk chaining (small)</text>
+<rect x="542" y="186" width="180" height="72" rx="6" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="2"/>
+<text x="632" y="207" text-anchor="middle" font-family="monospace" font-size="11">k_scan_apply_sparse</text>
+<text x="632" y="224" text-anchor="middle" font-size="11">only carry-touched prefix</text>
+<text x="632" y="241" text-anchor="middle" fill="#5b6b7b" font-size="11">delta=0 segs: zero I/O</text>
+<rect x="742" y="198" width="100" height="48" rx="6" fill="#fff" stroke="#666"/><text x="792" y="218" text-anchor="middle" font-family="monospace" font-size="10">k_reduce_</text><text x="792" y="230" text-anchor="middle" font-family="monospace" font-size="10">chunk_hi</text><text x="792" y="243" text-anchor="middle" fill="#5b6b7b" font-size="10">strip wrap-up</text>
+<line x1="332" y1="222" x2="364" y2="222" stroke="#666" marker-end="url(#ah20)"/><line x1="508" y1="222" x2="540" y2="222" stroke="#666" marker-end="url(#ah20)"/><line x1="724" y1="222" x2="740" y2="222" stroke="#666" marker-end="url(#ah20)"/>
+<text x="430" y="304" text-anchor="middle" fill="#1c7c3c" font-size="11.5">Add/sub inputs break the "nearly normalized" range assumption and keep generic agg/apply — the assumption stays multiply-only</text>
+</svg><figcaption>Figure 14: Fusing and sparsifying the carry pipeline. During the one pass where the digits are resident in shared memory, the fat kernel on the left produces, in passing, every piece of metadata the downstream stages need.</figcaption></figure>
+<p>Measured on the full 1-hundred-million-digit run: multiply normalization shrinks from 6 kernels (standalone strip + a volley of five full sweeps) to 4; together with the frequency-domain three-in-one, the run's total kernel-launch count falls from 26,563 to 23,251.</p>
+
+<p>"No sweep" beats any "faster sweep" — in the sparse apply, a delta=0 segment doesn't touch a single byte. This "in passing + fused + sparse" combination hardened into the shipping carry pipeline, and it is the entire source of this rung's gain on the ladder.</p>
+<div class="callout"><b>Maxim 6: The endgame of optimizing a full-array sweep is making the sweep disappear.</b> After local normalization, a carry usually affects only a very short prefix — build a fast path for the common case, keep the generic path for the rare one, and let every "skip" be backed by an invariant (SegHi, the boundary of the range assumption).</div>
+<h2 id="c19">19. Correctness Verification</h2>
+<p>The thing a hand-built FFT fears most is "silently getting it wrong," and the retrofits on the ladder's later rungs — especially "compute-less" optimizations like the middle product and sparse carry — raise that risk another notch.</p>
+<p>① <b>Digit-by-digit comparison against a public reference</b>: the output matches the first 100,000,000 digits of the MIT mirror's billion-digit π file (pi-billion.txt) <b>in full</b> (the reference file itself was first checked on its first 50 digits and on the Feynman point's run of six 9s at digits 762–767).</p>
+<p>② <b>The red line throughout + a graded self-test ladder</b>: every multiplication checks the 0.25 red line (Section 6; in the production version it is accumulated device-side and adjudicated at checkpoints); the six-level self-test ladder exposes exactly one new class of risk per level — add/subtract carries cross-checked against Python big integers; schoolbook ↔ FFT cross-check; an identity covering <b>all</b> FFT configurations; Newton window checks (including warm-start reentry); a small-scale digit-by-digit π comparison; and only then the full 100 million digits (self-test all green: fft_err_max=0.0156 over 101 muls). Every batch of changes in Sections 12–18 must pass it first:</p>
+<pre class="code"><code># Excerpt from pi-numba/pi_agm.py — selftest S2: the identity (X+Y)² = X² + 2XY + Y² covers all FFT configurations
+    # S2: identity (X+Y)² = X² + 2XY + Y², covering every Q and the three-level path
+    for L in (4000, 8000, 16000, 32000, 65000, 130000, 260000, 520000, 1040000, 2080000,
+              4100000, 8300000, 16600000, 33000000, 41000000, 82000000):   # three-level zone R∈{2,4,8,16,32,64}, all tiers
+        X, Y = rand_big(L), rand_big(L)
+        S = C.big_add(X, Y)
+        lhs = F.mul_fft_path(S, S, True)
+        rhs = C.big_add(C.big_add(F.mul_fft_path(X, X, True), F.mul_fft_path(Y, Y, True)),
+                        C.big_scalar_mul(F.mul_fft_path(X, Y, False), 2))
+        N = F.fft_plan_n(2 * L + 1)
+        what = f"S2 identity (X+Y)^2, L={L}, N=2^{N.bit_length()-1}, Q={N//2048}"
+        if C.big_cmp(lhs, rhs) != 0: expect(False, what)
+        F.fft_error_checkpoint(what)
+        expect(True, what)
+        C.g_arena.restore(mark)</code></pre>
+<p>③ <b>middle product adversarial test</b> (middlebench): three classes of inputs — random, all-999, and ultra-long carry chains — are <b>cross-checked limb by limb</b> against the full multiplication. The latter two are precisely the scenarios where the Section 16 guard interval cannot, by design, collapse — in the logs they fall back to the full multiplication with <code>reason=carry_interval</code> and then match limb for limb. "The fallback happened" is itself a verified behavior: the real bad news would be an adversarial input silently taking the fast path.</p>
+<p>④ <b>The official 100-million-digit verdict</b>: the output is exactly 100,000,002 bytes long; a byte-by-byte comparison against the MIT file matches completely; the maximum residual is 0.00781 &lt; 0.25.</p>
+<p>The first 100 digits and the last 10 digits (digits 99,999,991 – 100,000,000):</p>
+<div class="digits">3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679…<br>……0187751592</div>
+
+<h2 id="c20">20. Closing Remarks</h2>
+<p>A few things worth taking with you:</p>
+<p>• <b>Algorithm before implementation</b>: quadratic convergence compresses 100 million digits into 26 rounds of big operations — pick the right algorithm, and the shape of the problem is already half right.<br>• <b>Profiling is not a ritual</b>: "the real culprit is not the suspect" played out again and again (σ scattering, the full-array carry sweep, the dispatcher fee) — every conviction came from the profiler and the stopwatch.<br>• <b>Save the most bytes, not the most instructions</b>: 2-for-1 packing, deep fusion, sparse carry — every major speedup in this story was a bandwidth ledger.<br>• <b>The deepest saving is to "compute less"</b>: the middle-product section alone is worth nearly as much as all the other optimization tiers combined — first ask what the caller actually needs, and only then how to compute it fast; and the license to "compute less" is issued by rigorous intervals and automatic fallback (Section 16), with adversarial tests as its annual inspection (④ in this section).<br>• <b>The library's kernel boundary is a line you draw</b>: inviting the math library into your kernel buys you not a faster FFT, but sovereignty over the load and write-back phases. That line was first drawn through data movement (Section 15), then through the frequency-domain middle stage (Section 17) and the carry chain (Section 18) — every step of the performance work grew out of that sovereignty.</p>
+<p class="small">Gauss–Legendre/Brent–Salamin, FFT big-number multiplication, Newton reciprocal/square root, carry-lookahead, and the middle product are all classical methods of high-precision arithmetic.</p>
+
+</main></body></html>
