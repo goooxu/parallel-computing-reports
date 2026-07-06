@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>把数学库请进 CUDA kernel —— 用 nvmath-python 搭建纯 Python 的设备端数学工作流（以一亿位 π 为例）</title>
+<title>把数学库请进 kernel —— 用 Numba CUDA 与 cuFFTDx 搭建纯 Python 的设备端数学工作流（以一亿位 π 为例）</title>
 <style>
 :root { --ink:#1c2733; --muted:#5b6b7b; --acc:#2c5f8f; --bg:#fbfbf9; --box:#f2f5f8; }
 * { box-sizing:border-box; }
@@ -42,8 +42,8 @@ math[display="block"] { display:block; margin:6px auto; overflow-x:auto; max-wid
 .small { font-size:13px; color:var(--muted); }
 .pass { color:#1c7c3c; font-weight:bold; }
 </style></head><body><main>
-<h1>把数学库请进 CUDA kernel</h1>
-<p class="subtitle">用 nvmath-python 搭建纯设备端数学工作流 —— 以计算 100,000,000 位 π 为贯穿案例：从库的用法、大 FFT 的搭建，到一整套性能工程的完整记录</p>
+<h1>把数学库请进 kernel</h1>
+<p class="subtitle">用 Numba CUDA 与 nvmath-python 搭建纯设备端数学工作流 —— 以计算 100,000,000 位 π 为贯穿案例：从库的用法、大 FFT 的搭建，到一整套性能工程的完整记录</p>
 <p class="meta">不借助任何第三方大数学库：大整数的加、减、乘（FFT）、除、开方全部从零实现，结果与公开的 π 基准数据逐位比对通过。</p>
 <div class="toc"><b>目录</b><br><a href="#c1">1. 开篇：这篇教程教什么</a><a href="#c2">2. 并行第一课：从循环到整片数组</a><a href="#c3">3. 打电话，还是请进厨房</a><a href="#c4">4. 运行示例登场：一亿位 π</a><a href="#c5">5. 数学积木 I：limb 大数与进位</a><a href="#c6">6. 数学积木 II：FFT 乘法与 0.25 红线</a><a href="#c7">7. 数学积木 III：牛顿迭代</a><a href="#c8">8. 算法主角：Gauss–Legendre</a><a href="#c9">9. 牛顿的两件武器</a><a href="#c10">10. 一个线程块里的 2048 点 FFT</a><a href="#c11">11. 超出一个块：四步法与三级分解</a><a href="#c12">12. 少搬字节：2-for-1 与融合</a><a href="#c13">13. 少发射、合并访问</a><a href="#c14">14. Python 的发射税</a><a href="#c15">15. 深度融合：设备端库的独门优势</a><a href="#c16">16. 精确 middle product</a><a href="#c17">17. 频域三合一</a><a href="#c18">18. 进位流水线</a><a href="#c19">19. 正确性验证</a><a href="#c20">20. 结语</a></div>
 <h2 id="c1">1. 开篇：这篇教程教什么</h2>
@@ -835,8 +835,8 @@ def k_scan_apply_sparse(s, n, sign, res, Cin, Tgp, SegHi, Hc):
         C.g_arena.restore(mark)</code></pre>
 <p>③ <b>middle product 对抗测试</b>（middlebench）：随机输入、全 999、超长进位链三类输入与完整乘法<b>逐 limb 对拍</b>。后两类正是第 16 节 guard 区间设计上无法坍缩的场景——日志里它们以 <code>reason=carry_interval</code> 回退到完整乘法，然后逐 limb 一致。「回退发生了」本身就是被验证的行为：若对抗输入悄悄走了快路径，才是真正的坏消息。</p>
 <p>④ <b>一亿位正式判定</b>：输出长度恰为 100,000,002 字节；MIT 文件逐字节比对完全一致；最大残差 0.00781 &lt; 0.25。</p>
-<div class="callout"><p>前 100 位与最后 10 位（第 99,999,991 – 100,000,000 位）：</p>
-<div class="digits">3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679…<br>……0187751592</div></div>
+<p>前 100 位与最后 10 位（第 99,999,991 – 100,000,000 位）：</p>
+<div class="digits">3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679…<br>……0187751592</div>
 
 <h2 id="c20">20. 结语</h2>
 <p>几件值得带走的事：</p>
