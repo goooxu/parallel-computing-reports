@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>把数学库请进 kernel —— 用 Numba CUDA 与 cuFFTDx 搭建纯 Python 的设备端数学工作流（以一亿位 π 为例）</title>
+<style>
+:root { --ink:#1c2733; --muted:#5b6b7b; --acc:#2c5f8f; --bg:#fbfbf9; --box:#f2f5f8; }
+* { box-sizing:border-box; }
+body { font-family:"Noto Sans CJK SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+       color:var(--ink); background:var(--bg); margin:0; line-height:1.75; }
+main { max-width:960px; margin:0 auto; padding:24px 20px 80px; }
+h1 { font-size:30px; margin:26px 0 4px; }
+h2 { font-size:22px; margin:44px 0 10px; border-left:5px solid var(--acc); padding-left:12px; }
+h3 { font-size:17px; margin:28px 0 8px; color:var(--acc); }
+p { margin:10px 0; }
+.subtitle { color:var(--muted); font-size:16px; margin-bottom:2px; }
+.meta { color:var(--muted); font-size:13px; border-bottom:1px solid #ddd; padding-bottom:14px; }
+.callout { background:var(--box); border-left:4px solid var(--acc); padding:10px 16px; border-radius:0 8px 8px 0; margin:14px 0; }
+.warn { border-left-color:#c07a3a; }
+.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:14px 0; }
+@media(max-width:680px){ .grid2 { grid-template-columns:1fr; } }
+.gbox { background:var(--box); border:1px solid #e2e6ea; border-radius:8px; padding:10px 14px; }
+pre.code { background:#20262e; color:#e8edf2; padding:14px 16px; border-radius:8px;
+           overflow-x:auto; font-size:13px; line-height:1.55; }
+pre.code code { font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace; }
+code { font-family:Consolas,monospace; background:#edf0f3; padding:1px 5px; border-radius:4px; font-size:0.92em; }
+pre.code code { background:none; padding:0; }
+table { border-collapse:collapse; margin:14px 0; width:100%; font-size:14px; }
+th, td { border:1px solid #d6dce2; padding:7px 10px; text-align:left; }
+th { background:#e8eef4; }
+td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+figure { margin:20px 0; text-align:center; }
+figure svg { width:100%; height:auto; background:#fff; border:1px solid #e2e6ea; border-radius:8px; }
+figcaption { color:var(--muted); font-size:13px; margin-top:6px; }
+.toc { background:var(--box); border-radius:8px; padding:14px 22px; }
+.toc a { color:var(--acc); text-decoration:none; display: block; }
+.digits { font-family:Consolas,monospace; font-size:13px; word-break:break-all;
+          background:#fff; border:1px dashed #bbb; padding:10px 12px; border-radius:6px; }
+math { font-size:1.08em; }
+math[display="block"] { display:block; margin:6px auto; overflow-x:auto; max-width:100%; }
+.mrow { text-align:center; margin:12px 0; background:var(--box); border:1px solid #e2e6ea;
+        border-radius:8px; padding:8px 12px; }
+.small { font-size:13px; color:var(--muted); }
+.pass { color:#1c7c3c; font-weight:bold; }
+</style></head><body><main>
+<h1>把数学库请进 kernel</h1>
+<p class="subtitle">用 Numba CUDA 与 nvmath-python 搭建纯设备端数学工作流 —— 以计算 100,000,000 位 π 为贯穿案例：从库的用法、大 FFT 的搭建，到一整套性能工程的完整记录</p>
+<p class="meta">不借助任何第三方大数学库：大整数的加、减、乘（FFT）、除、开方全部从零实现，结果与公开的 π 基准数据逐位比对通过。</p>
+<div class="toc"><b>目录</b><br><a href="#c1">1. 开篇：这篇教程教什么</a><a href="#c2">2. 并行第一课：从循环到整片数组</a><a href="#c3">3. 打电话，还是请进厨房</a><a href="#c4">4. 运行示例登场：一亿位 π</a><a href="#c5">5. 数学积木 I：limb 大数与进位</a><a href="#c6">6. 数学积木 II：FFT 乘法与 0.25 红线</a><a href="#c7">7. 数学积木 III：牛顿迭代</a><a href="#c8">8. 算法主角：Gauss–Legendre</a><a href="#c9">9. 牛顿的两件武器</a><a href="#c10">10. 一个线程块里的 2048 点 FFT</a><a href="#c11">11. 超出一个块：四步法与三级分解</a><a href="#c12">12. 少搬字节：2-for-1 与融合</a><a href="#c13">13. 少发射、合并访问</a><a href="#c14">14. Python 的发射税</a><a href="#c15">15. 深度融合：设备端库的独门优势</a><a href="#c16">16. 精确 middle product</a><a href="#c17">17. 频域三合一</a><a href="#c18">18. 进位流水线</a><a href="#c19">19. 正确性验证</a><a href="#c20">20. 结语</a></div>
+<h2 id="c1">1. 开篇：这篇教程教什么</h2>
+<p>在 GPU 上做数学，有两种截然不同的用库姿势。第一种是<b>打电话</b>：调用 cuFFT 这类主机端库，一个函数进去，库替你把事情做完——它自己发射 kernel、自己管调度，你等结果。第二种是<b>把库请进自己的 kernel</b>：cuFFTDx（NVIDIA MathDx 里的设备端 FFT 库）不替你做完任何事，它只是把「一个线程块内的小 FFT」变成你 kernel 代码里的<b>一行普通语句</b>，数据在你自己的寄存器和共享内存里，进出这行语句前后的每一个字节搬运都归你管。</p>
+<p>这篇教程完整走一遍第二种姿势：怎么在 Python 里拼出变换的「菜谱」、怎么在一个 CUDA kernel 里执行它、怎么把「一个块装得下」的小变换拼成 2<sup>28</sup> 点的大 FFT，以及——最重要的——「自己掌管数据进出」这件事到底值多少性能。为了让答案有分量，我们选了一个足够狠的贯穿案例：<b>在一块 H100 上，把 π 计算到 100,000,000 位</b>，全部大数运算从零实现。先亮成绩单：</p>
+<table><tr><th>指标</th><th class="num">数值</th></tr><tr><td>目标</td><td class="num">π 的 100,000,000 位十进制</td></tr><tr><td>用时</td><td class="num"><b>5.630 秒</b></td></tr><tr><td>正确性</td><td class="num"><span class="pass">PASS</span>（与 MIT 公开基准前一亿位逐位比对，第 19 节）</td></tr></table>
+<p>成绩单之外，这篇教程真正想讲的是「怎么到达这里」：后半部分逐项拆解这条流水线的性能工程——省字节、进位的并行化、访存形态，以及压轴的 kernel 深度融合。其中最深的那一层改造（把纯搬运工作折进计算 kernel 的装载/写回相位），只有当 FFT 是「你 kernel 里的一行」时才写得出来——这正是设备端库的独门优势，也是本文标题的含义。</p>
+<div class="callout">路线图：第 2–3 节立论（并行的心法、两种用库模型）；第 4–9 节把 π 案例的数学积木搭起来（limb 大数、FFT 乘法、牛顿迭代、Gauss–Legendre）；第 10–11 节是设备端方法论的核心（把 cuFFTDx 请进 Numba kernel、拼出大 FFT）；第 12–18 节逐项拆解性能工程（第 14 节算清 Python 特有的发射税，第 16 节的精确 middle product 一刀最深，第 18 节的进位流水线收官）；第 19 节是验证与结语。<b>已熟悉 GPU 与高精度计算的读者可以直接从第 10 节读起</b>；只想看结论的读者读第 1、16、19 节即可。</div>
+<h2 id="c2">2. 并行第一课：从「循环」到「整片数组」</h2>
+<div class="grid2"><div class="gbox"><b>CPU＝几位博士生</b><br>核心少但强，擅长「一步依赖上一步」的复杂逻辑；跑 <code>for</code> 循环是一次一格。</div><div class="gbox"><b>GPU＝上万名小学生</b><br>这块 H100 有一万多个 CUDA 核心，每个只会简单算术，但能<b>同时开工</b>。</div></div>
+<p>GPU 程序的最小组织单位是<b>线程</b>；线程按<b>线程块</b>分组（本文的块多为 256 线程），同一块内的线程可以用一小片超快的<b>共享内存</b>协作，块与块之间只能通过<b>显存</b>见面。要让上万个核心都有活干，就得把「逐元素的循环」改写成「对整片数组的一次运算」：</p>
+<figure><svg viewBox="0 0 720 190" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="13">
+<text x="10" y="18" font-size="14" fill="#5b6b7b">串行 CPU：n 步</text><text x="430" y="18" font-size="14" fill="#5b6b7b">并行 GPU：一次</text>
+<rect x="10" y="34" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/><rect x="10" y="66" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/><rect x="10" y="98" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/><rect x="10" y="130" width="58" height="26" fill="#eef1f7" stroke="#c9d2e3"/>
+<text x="78" y="52">a[0]=b[0]+c[0]</text><text x="78" y="84">a[1]=b[1]+c[1]</text><text x="78" y="116">a[2]=b[2]+c[2]</text><text x="78" y="148">…（第 n 步）</text>
+<path d="M39 60 L39 66 M39 92 L39 98 M39 124 L39 130" stroke="#c07a3a" stroke-width="2"/>
+<g transform="translate(430,0)"><rect x="0" y="34" width="56" height="122" fill="#eefaf2" stroke="#8fd3ad"/>
+<text x="7" y="52" fill="#1c7c3c">a[0]</text><text x="7" y="80" fill="#1c7c3c">a[1]</text><text x="7" y="108" fill="#1c7c3c">a[2]</text><text x="7" y="140" fill="#1c7c3c">a[n-1]</text>
+<text x="56" y="98">= b + c</text></g></svg><figcaption>图 1：左边 <code>for i: a[i]=b[i]+c[i]</code> 是 n 步顺序执行；右边 <code>a = b + c</code> 一次并行完成。</figcaption></figure>
+<div class="callout"><b>全文最重要的一句话：</b>后面每一个大数运算，我们都会把它写成「对整片 limb 数组的运算」，这样它才真正跑在 GPU 上。做不到这一点的运算（比如天生串行的逐位进位），就要找到它的并行等价形式——这是第 5 节和第 13 节的主题。</div>
+<p>这一课还有下半句，也是本文的独特视角：把循环改成整片运算之后，<b>每一遍「整片」都是一次全量显存读写</b>。一亿位 π 的中间数组动辄 4GB，多走一遍显存就是多花几毫秒。谁掌管这些「遍数」，谁就掌管性能——这正是下一节两种用库模型的分水岭。</p>
+<h2 id="c3">3. 打电话，还是请进厨房</h2>
+<p>先看熟悉的<b>主机调用模型</b>。用 cuFFT 做一次「变换—逐点乘—逆变换」，主机代码的典型形态是：</p>
+<pre class="code"><code># 示意：主机调用模型的一次大数乘法
+buf = to_complex(a_limbs)                      # ① 前处理：自己先发射一个 kernel、一遍全长读写
+fa = cp.fft.fft(buf)                           # ② 打电话：库发射它自己的 kernel 做正变换
+fb = cp.fft.fft(to_complex(b_limbs))           # ③ 第二个操作数，再打一次电话
+spec = fa * fb                                 # ④ 逐点乘：cupy 为这一行再发射一个 kernel
+raw = cp.fft.ifft(spec)                        # ⑤ 逆变换（再打一次电话）
+digits = cp.rint(raw.real)                     # ⑥ 取整：又一遍全长读写
+carry_kernel[blocks, 256](digits, out_limbs)   # ⑦ 逐位进位：自己的 Numba kernel 收尾
+# 每步之间数据都要整片经过显存；库 kernel 内部一行也插不进去</code></pre>
+<p>这个模型的合同很清楚：你在 CPU 上建好 plan（库的执行计划句柄），把数据放进显存，打一个电话，库发射<b>它自己的</b> kernel 把这一步做完。省心，成熟，快——但有两条写死在合同里的限制：<b>①每一步之间，数据必须整片躺回显存</b>（库 kernel 的输入输出只认显存指针）；<b>②库 kernel 内部你一行代码都插不进去</b>（想在装载时顺手做个类型转换？对不起，先自己发射一个 kernel 把类型转好）。</p>
+<p><b>设备内联模型</b>把这两条合同全部撕掉。cuFFTDx 经 nvmath-python 的设备端 API 进入 Python：你在<b>构造期</b>用「关键字参数拼配料」的方式声明想要什么变换，它给你一个描述符；在<b>你自己的 kernel</b> 里，这个描述符的 <code>execute()</code> 就地完成一个线程块内的 FFT——不发射新 kernel，数据全程在你的寄存器和共享内存里：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— 设备内联的最小骨架（make_stageD）：库的 FFT 是你 kernel 里的一行
+def make_stageD(Q, inv):
+    fpb = min(256, 2048 // Q)
+    fft = _dx(Q, inv, fpb)
+    ...
+    @cuda.jit
+    def k_stageD(data, rowStride):
+        rd = cuda.local.array(shape=(st,), dtype=vt)
+        sm = cuda.shared.array(shape=(0,), dtype=vt)
+        base = cuda.blockIdx.y * rowStride
+        offset = (cuda.blockIdx.x * fpb + cuda.threadIdx.y) * Q
+        for i in range(ept):
+            e = cuda.threadIdx.x + i * stride
+            if e &lt; Q:
+                rd[i] = data[base + offset + e]
+        fft.execute(rd, sm)
+        for i in range(ept):
+            e = cuda.threadIdx.x + i * stride
+            if e &lt; Q:
+                data[base + offset + e] = rd[i]</code></pre>
+<div class="grid2"><div class="gbox"><b>它们是谁</b><br>Dx = <b>D</b>evice E<b>x</b>tensions（设备端扩展）。cuFFTDx 属 NVIDIA <b>MathDx</b> 合集——与 CUDA Toolkit 相互独立、单独发布的设备端数学库，家族里还有 cuSolverDx（分解/特征值）、cuRANDDx（随机数）、nvCOMPDx（压缩）。本文经 <b>nvmath-python</b> 的 <code>nvmath.device</code> API 在纯 Python 里使用 cuFFTDx：pip 一行装好。</div><div class="gbox"><b>年表与要求</b><br>cuFFTDx 最年长：经历早期体验阶段后于 2022 年发布 1.0 正式版；把它带进 Python 世界的 nvmath-python 年轻得多——设备端 API 仍标注 beta，演进很快。</div></div>
+<figure><svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ahd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="215" y="22" font-size="14" text-anchor="middle" fill="#222">主机调用模型（cuFFT / cuBLAS）</text>
+<text x="645" y="22" font-size="14" text-anchor="middle" fill="#222">设备内联模型（cuFFTDx）</text>
+<rect x="40" y="40" width="350" height="52" rx="6" fill="#eef3fa" stroke="#666"/>
+<text x="215" y="61" text-anchor="middle">CPU：建 plan、调 cufftExecD2Z(...)</text>
+<text x="215" y="80" text-anchor="middle" fill="#5b6b7b">每一步都是一次「打电话」</text>
+<rect x="60" y="128" width="140" height="44" rx="6" fill="#f4e9e9" stroke="#666"/><text x="130" y="147" text-anchor="middle">库的 kernel A</text><text x="130" y="163" text-anchor="middle" fill="#5b6b7b">（黑盒）</text>
+<rect x="230" y="128" width="140" height="44" rx="6" fill="#f4e9e9" stroke="#666"/><text x="300" y="147" text-anchor="middle">库的 kernel B</text><text x="300" y="163" text-anchor="middle" fill="#5b6b7b">（黑盒）</text>
+<rect x="40" y="216" width="350" height="40" rx="6" fill="#faf0e6" stroke="#666"/>
+<text x="215" y="240" text-anchor="middle">显存：每步之间数据必须整片进出</text>
+<line x1="130" y1="92" x2="130" y2="126" stroke="#666" marker-end="url(#ahd)"/>
+<line x1="300" y1="92" x2="300" y2="126" stroke="#666" marker-end="url(#ahd)"/>
+<line x1="110" y1="172" x2="110" y2="214" stroke="#c07a3a" stroke-width="2" marker-end="url(#ahd)"/>
+<line x1="150" y1="214" x2="150" y2="174" stroke="#c07a3a" stroke-width="2" marker-end="url(#ahd)"/>
+<line x1="280" y1="172" x2="280" y2="214" stroke="#c07a3a" stroke-width="2" marker-end="url(#ahd)"/>
+<line x1="320" y1="214" x2="320" y2="176" stroke="#c07a3a" stroke-width="2" marker-end="url(#ahd)"/>
+<text x="215" y="285" text-anchor="middle" fill="#c07a3a">↑ 每个箭头都是一遍全量显存读或写</text>
+<text x="215" y="304" text-anchor="middle" fill="#5b6b7b">库 kernel 内部一行代码都插不进去</text>
+<rect x="470" y="40" width="350" height="216" rx="8" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="2"/>
+<text x="645" y="62" text-anchor="middle" fill="#1c7c3c">你自己的一个 kernel</text>
+<rect x="495" y="76" width="300" height="40" rx="6" fill="#fff" stroke="#666"/>
+<text x="645" y="100" text-anchor="middle">自定义装载（顺手做类型转换/twiddle/置换）</text>
+<rect x="495" y="130" width="300" height="40" rx="6" fill="#fdeeee" stroke="#666"/>
+<text x="645" y="154" text-anchor="middle" font-family="monospace">FFT().execute(rd, smem)  ← 库在这儿</text>
+<rect x="495" y="184" width="300" height="40" rx="6" fill="#fff" stroke="#666"/>
+<text x="645" y="208" text-anchor="middle">自定义写回（顺手做取整/换序/点乘）</text>
+<line x1="565" y1="118" x2="565" y2="128" stroke="#666" marker-end="url(#ahd)"/>
+<line x1="565" y1="172" x2="565" y2="182" stroke="#666" marker-end="url(#ahd)"/>
+<rect x="470" y="268" width="350" height="34" rx="6" fill="#faf0e6" stroke="#666"/>
+<text x="645" y="289" text-anchor="middle">显存：整段流水只有一进一出</text>
+<line x1="600" y1="256" x2="600" y2="266" stroke="#1c7c3c" stroke-width="2" marker-end="url(#ahd)"/>
+<line x1="690" y1="266" x2="690" y2="258" stroke="#1c7c3c" stroke-width="2" marker-end="url(#ahd)"/>
+</svg><figcaption>图 2：两种模型的数据通路。左：每步之间一次全量显存往返，库 kernel 是黑盒；右：整段流水一进一出，装载/写回相位是你自己的代码——想「顺手」干什么都行。</figcaption></figure>
+<table><tr><th></th><th>主机调用（cuFFT/cuBLAS）</th><th>设备内联（cuFFTDx）</th></tr><tr><td>谁发射 kernel</td><td>库（黑盒）</td><td>你（库只是 kernel 里的一行）</td></tr><tr><td>数据在哪</td><td>每步进出显存</td><td>你的寄存器 / 共享内存</td></tr><tr><td>能否融合前后处理</td><td>基本不能（唯一的官方口子是回调机制，窄且脆）</td><td>随便融——装载/写回相位是你的代码</td></tr><tr><td>规模上限</td><td>近乎任意</td><td>一个线程块装得下的规模（fp64 几千点）</td></tr><tr><td>成熟度</td><td>二十年打磨</td><td>你自己拼，正确性自己保证（第 19 节）</td></tr></table>
+<div class="callout"><b>全文的伏笔：</b><code>fft.execute(rd, smem)</code> 这行代码前后的每一个字节搬运都归你管。第 12–16 节性能工程里最深的一层，就长在「装载相位顺手做 twiddle」「写回相位顺手做取整」这些主机调用模型里<b>根本不存在的动词</b>上。</div>
+<p>当然，天下没有免费的午餐：设备内联模型的上限是「一个线程块装得下」，而我们需要 2<sup>28</sup> 点——大 FFT 得自己拆、自己拼（第 11 节）；拼错了没人兜底，所以还得自己搭一副验证梯子（第 19 节）。先看看这个案例到底有多大。</p>
+<h2 id="c4">4. 运行示例登场：一亿位 π，为什么它能逼出一切</h2>
+<p>为什么不能直接算？<b>浮点数装不下。</b><code>float64</code> 只有约 15～16 位有效数字，离一亿位差了 7 个数量级——这不是精度不够，而是类型里根本没那么多位置。而 GPU 上又没有现成的「大整数」类型，所以要<b>自己用一大片小数字拼出一个大数</b>（第 5 节），再把大数的加减乘除全部翻译成整片数组运算。这个案例的负载画像如下：</p>
+<table><tr><th>指标</th><th class="num">数值</th><th>含义</th></tr><tr><td>目标位数 / 工作精度 p</td><td class="num">10<sup>8</sup> / 100,000,050</td><td>50 位保护位，p 取 3 的倍数</td></tr><tr><td>limb 数组长度</td><td class="num">33,333,350</td><td>每 limb 3 位十进制（基 1000，int32）</td></tr><tr><td>AGM 迭代轮数</td><td class="num">26</td><td>二次收敛：每轮一致位数翻倍（第 8 节）</td></tr><tr><td>牛顿步数</td><td class="num">443</td><td>每轮一次全精度开方 + 收尾一次倒数（第 9 节）</td></tr><tr><td>FFT 大乘法次数</td><td class="num">1062</td><td>最大规模 N = 2<sup>28</sup>（第 11 节）</td></tr><tr><td>FFT 最大舍入误差</td><td class="num">0.00781</td><td>红线 0.25（第 6 节）</td></tr><tr><td>显存峰值</td><td class="num">≈ 6.5 GB</td><td>单个牛顿步的临时量可达 ~12GB（arena 池化复用后 7.9，middle product 缩小 FFT 后 6.5）</td></tr></table>
+<p>为什么选它当教程案例？因为它把设备端工作流的每一个环节都逼到了台前：大 FFT 必须自己从块级积木拼起（2<sup>28</sup> 点远超一个块的容量）；1062 次大乘法让每一遍多余的显存读写都被放大一千倍；26 轮迭代、几百步牛顿让 kernel 发射开销无处藏身；而「必须逐位正确」让所有 trick 都要过验证这一关。</p>
+<div class="callout">角色分工：π 的数学（第 5–9 节）是<b>积木</b>——它们决定我们要算什么；设备端方法论与性能工程（第 10–18 节）是<b>主角</b>——它决定同样的数学算得多快。赶时间的读者可以把第 5–9 节当参考手册跳过，不影响主线。</div>
+<h2 id="c5">5. 数学积木 I：limb 大数、进位，与 999…9 暗礁</h2>
+<p><b>表示。</b>把大整数拆成许多 0～999 的小数字，每个叫一个 <b>limb</b>，整体是一个 <code>int32</code> 数组（低位在前）。选基 B=1000（=10³）是因为最终要输出十进制：每个 limb 恰好 3 位数字，输出零成本。一亿位的 π 就是约 3,333 万个 limb 的数组（130MB 出头）。</p>
+<figure><svg viewBox="0 0 660 92" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="14">
+<text x="10" y="16" font-size="12" fill="#5b6b7b">数值 12,345,678 = 678 + 345·1000 + 12·1000²</text>
+<g transform="translate(0,28)"><rect x="20" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0"/><text x="52" y="25">12</text>
+<rect x="120" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0"/><text x="145" y="25">345</text>
+<rect x="220" y="0" width="90" height="38" fill="#eef4ff" stroke="#9db8f0"/><text x="245" y="25">678</text>
+<text x="20" y="55" font-size="11" fill="#5b6b7b">limb[2]（高位）</text><text x="230" y="55" font-size="11" fill="#5b6b7b">limb[0]（低位）</text></g></svg><figcaption>图 3：大整数 = limb 数组（小端，下标 0 是最低位）。</figcaption></figure>
+<p><b>加法与进位。</b>小学的「逐位相加、逢千进一」是天生串行的（第 k 位的进位要等第 k−1 位），正撞在第 2 节心法的枪口上。GPU 上改成两步：先<b>整片相加</b>（有些 limb 暂时超过 999，不管它），再<b>并行传播进位</b>。传播这一步藏着全项目最险的暗礁：牛顿迭代（第 7 节）会系统性地制造<b>1 后面跟几十万个 0</b>（或差一点时的 999…9）这种数——一个 +1 的进位要穿过整条 0/9 长链。「多趟传播、每趟推一格」的朴素并行版在这种输入上退化成 O(n) 趟：百万位规模的一次乘法，进位就要传播 166,679 趟——十几万次 kernel 发射，光发射开销就以十秒计，完全不可用。</p>
+<p>解法与硬件加法器的经典答案同源——<b>进位前瞻</b>（carry-lookahead）。观察：残余进位只会「穿过」999（借位只会穿过 000），在其他任何数字上都会被吸收。于是「位置 i 会不会收到进位」＝「i 下方最近的非 999 位置是否点火」——这是一个<b>前缀扫描</b>（prefix scan），一次算完所有位置，链再长也一趟到底：</p>
+<pre class="code"><code># 串行进位（一次只能走一格）              # 并行前缀版（一次扫描走到底）
+carry = 0                                 # 残余进位 ∈ {0,±1} 时：
+for i in range(n):                        #   999 会让进位「穿过」(propagate)
+    v = s[i] + carry                      #   ≥1000 必然「产生」进位 (generate)
+    s[i] = v % 1000                       # (g,p) 是可结合的半群 → 分块前缀扫描
+    carry = v // 1000                     # CUDA 三个 kernel：块内聚合→块间串链→应用</code></pre>
+<div class="callout warn"><b>教训：</b>向量化原语的「平均情况」性能可能藏着 O(n) 的最坏情况，而数值算法恰恰会系统性地制造最坏情况输入。<b>快算法会把压力转移给基础设施。</b></div>
+<p class="small">减法用对称的借位写法；比较大小从最高位找第一个不同的 limb；「除以 2」有个漂亮的并行技巧：基 1000 是偶数，第 i 位结果 = <code>d[i]/2 + 500·(d[i+1] 是否为奇)</code>，所有 limb 一次算完、无需传播。这些原语的 CUDA 实现全在 <code>common.py</code>。进位的最终形态（两阶段精确进位）在第 13 节。</p>
+<h2 id="c6">6. 数学积木 II：FFT 乘法与 0.25 红线</h2>
+<p>把大数看成「1000 进制多项式」，两数相乘＝系数做<b>卷积</b>。朴素卷积是 O(n²)——对 3,333 万 limb 大约是 10<sup>15</sup> 次乘加，要算上几十分钟，而我们要做 1062 次。<b>卷积定理</b>给出近路：</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>x</mi><mo>&#8901;</mo><mi>y</mi><mo>=</mo><msup><mi>F</mi><mrow><mo>&#8722;</mo><mn>1</mn></mrow></msup><mrow><mo>(</mo><mi>F</mi><mo>(</mo><mi>x</mi><mo>)</mo><mo>&#8857;</mo><mi>F</mi><mo>(</mo><mi>y</mi><mo>)</mo><mo>)</mo></mrow><mo>,&#x2003;</mo><mtext>&#9737; 为逐点相乘</mtext></mrow></math></div>
+<figure><svg viewBox="0 0 680 155" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="12.5">
+<rect x="20" y="26" width="140" height="36" fill="#fdecec" stroke="#e6a6a6"/><text x="90" y="49" text-anchor="middle">两个系数数组</text>
+<rect x="20" y="104" width="140" height="34" fill="#eefaf2" stroke="#8fd3ad"/><text x="90" y="126" text-anchor="middle">乘积系数</text>
+<text x="90" y="86" text-anchor="middle" fill="#c07a3a" font-size="11">直接卷积 O(n²) ✗</text>
+<rect x="270" y="10" width="150" height="32" fill="#eef4ff" stroke="#9db8f0"/><text x="345" y="31" text-anchor="middle">频域（各自）</text>
+<rect x="270" y="120" width="150" height="30" fill="#eef4ff" stroke="#9db8f0"/><text x="345" y="140" text-anchor="middle">频域乘积</text>
+<path d="M162 38 C 230 18,250 18,270 26" fill="none" stroke="#2c5f8f" stroke-width="2"/><text x="205" y="14" fill="#2c5f8f">① FFT</text>
+<path d="M345 42 L345 120" stroke="#2c5f8f" stroke-width="2"/><text x="352" y="86" fill="#2c5f8f">② 逐点乘 O(n)</text>
+<path d="M270 135 C 220 140,200 135,162 125" fill="none" stroke="#2c5f8f" stroke-width="2"/><text x="195" y="152" fill="#2c5f8f">③ 逆 FFT</text>
+<text x="470" y="80" fill="#1c7c3c" font-size="13">总 O(n log n) ✓</text></svg><figcaption>图 4：FFT 乘法——把难做的卷积变成好做的逐点相乘，总代价 O(n log n)。</figcaption></figure>
+<p><b>浮点怎么算出精确整数？</b>FFT 内部用 float64，但 float64 能精确表示到 2<sup>53</sup> ≈ 9×10<sup>15</sup>。一亿位时卷积系数最大约 n·999² ≈ 3.34×10<sup>7</sup>×10<sup>6</sup> ≈ 3.3×10<sup>13</sup>——离上限还有约 270 倍。但这只是「系数本身装得下」；FFT 的几千万次浮点乘加还会累积舍入误差，所以每次乘法都设一道<b>安全阀</b>：检查每个浮点结果距最近整数的距离，超过 0.25 立即报错退出——绝不悄悄算错：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— 每次乘法的 0.25 红线：残差在设备侧累积，检查点回读判罚
+def fft_error_read():
+    bits = int(g_err.get()[0])
+    cp.cuda.runtime.memsetAsync(g_err.data.ptr, 0, 8, 0)
+    return np.frombuffer(np.int64(bits).tobytes(), dtype=np.float64)[0]
+
+def fft_error_checkpoint(where=""):
+    # 残差在设备侧累积、检查点回读判罚（红线不撤）
+    err = fft_error_read()
+    if err > g_cnt.fft_err_max:
+        g_cnt.fft_err_max = err
+    assert err &lt; 0.25, f"FFT rounding error too large: {err} at {where}"</code></pre>
+<p>一亿位全程的实测最大误差是 0.00781 ——比红线低一个数量级，但已经能看出：基 1000 在 2<sup>28</sup> 点这个规模上接近极限了（再大十倍就得换基 100）。红线的价值正在于此：它把「精度快不够了」变成显式可观测的量，而不是某天悄悄输出一串错误数字。</p>
+<p class="small">很小的乘法（两数长度之积——即 O(n²) 的乘加次数——≤ 1.6×10<sup>7</sup>）直接用 schoolbook kernel，躲开 FFT 的固定开销——牛顿爬升的低层级全是这种小乘法。</p>
+<h2 id="c7">7. 数学积木 III：牛顿迭代——只用乘法造出除法与开方</h2>
+<p>算 π 还需要除法和开方，但我们只想用已经造好的乘法。牛顿迭代做到了。求倒数 1/T：</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>x</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msub><mi>x</mi><mi>n</mi></msub><mo>&#8290;</mo><mo>(</mo><mn>2</mn><mo>&#8722;</mo><mi>T</mi><mo>&#8901;</mo><msub><mi>x</mi><mi>n</mi></msub><mo>)</mo></math></div>
+<p>求倒数平方根 1/√K（开方即 √K = K·(1/√K)）：</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><msub><mi>y</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><mfrac><mrow><msub><mi>y</mi><mi>n</mi></msub><mo>&#8290;</mo><mo>(</mo><mn>3</mn><mo>&#8722;</mo><mi>K</mi><mo>&#8901;</mo><msubsup><mi>y</mi><mi>n</mi><mn>2</mn></msubsup><mo>)</mo></mrow><mn>2</mn></mfrac></math></div>
+<p>两个迭代都只有乘法、减法和「除以 2」（第 5 节的并行取半），而且都<b>二次收敛</b>——每迭代一步，正确位数<b>翻倍</b>：15 → 30 → 60 → … → 10<sup>8</sup>，从一个 <code>float64</code> 种子出发约 23 步到位。在整数世界里，1/√K 被表示成 y ≈ B<sup>h</sup>/√K 的定点放大形式（h 比 K 的 limb 数略大，实现中取 h = len(K)+2；于是 K·y² ≈ B<sup>2h</sup>，第 9 节代码里的残差 B<sup>2h</sup> − K·y² 正来源于此），「除以 B 的幂」恰好是把数组低位整段丢掉——精确且零成本。</p>
+<div class="callout">记住「每步位数翻倍」——第 8 节选算法、第 9 节的两件武器，全部建立在这一个性质上。</div>
+<h2 id="c8">8. 算法主角：Gauss–Legendre 与定点缩放</h2>
+<p>基础设施齐了，用什么公式算 π？最出名的莱布尼茨级数是反面教材：</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mfrac><mi>&#960;</mi><mn>4</mn></mfrac><mo>=</mo><mn>1</mn><mo>&#8722;</mo><mfrac><mn>1</mn><mn>3</mn></mfrac><mo>+</mo><mfrac><mn>1</mn><mn>5</mn></mfrac><mo>&#8722;</mo><mfrac><mn>1</mn><mn>7</mn></mfrac><mo>+</mo><mo>&#8943;</mo></math></div>
+<p>一百万项才换来 6～7 位。历史上有收敛快得多的级数（好的每项贡献十几位），但级数有个共同天花板：正确位数与项数<b>成正比</b>（线性收敛），而且海量小项的合并是 GPU 最不喜欢的碎负载。Gauss–Legendre（Brent–Salamin，1976）不做级数求和，而是反复施加一组极简单的变换：</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><msub><mi>a</mi><mn>0</mn></msub><mo>=</mo><mn>1</mn><mo>,</mo><msub><mi>b</mi><mn>0</mn></msub><mo>=</mo><mfrac><mn>1</mn><msqrt><mn>2</mn></msqrt></mfrac><mo>,</mo><msub><mi>t</mi><mn>0</mn></msub><mo>=</mo><mfrac><mn>1</mn><mn>4</mn></mfrac><mo>,</mo><msub><mi>p</mi><mn>0</mn></msub><mo>=</mo><mn>1</mn></mrow></math></div>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><msub><mi>a</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><mfrac><mrow><msub><mi>a</mi><mi>n</mi></msub><mo>+</mo><msub><mi>b</mi><mi>n</mi></msub></mrow><mn>2</mn></mfrac><mo>,&#x2003;</mo><msub><mi>b</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msqrt><mrow><msub><mi>a</mi><mi>n</mi></msub><msub><mi>b</mi><mi>n</mi></msub></mrow></msqrt><mo>,&#x2003;</mo><msub><mi>t</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msub><mi>t</mi><mi>n</mi></msub><mo>&#8722;</mo><msub><mi>p</mi><mi>n</mi></msub><msup><mrow><mo>(</mo><msub><mi>a</mi><mi>n</mi></msub><mo>&#8722;</mo><msub><mi>a</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>)</mo></mrow><mn>2</mn></msup><mo>,&#x2003;</mo><msub><mi>p</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><mn>2</mn><msub><mi>p</mi><mi>n</mi></msub></mrow></math></div>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>&#960;</mi><mo>&#8776;</mo><mfrac><msup><mrow><mo>(</mo><msub><mi>a</mi><mi>n</mi></msub><mo>+</mo><msub><mi>b</mi><mi>n</mi></msub><mo>)</mo></mrow><mn>2</mn></msup><mrow><mn>4</mn><msub><mi>t</mi><mi>n</mi></msub></mrow></mfrac></mrow></math></div>
+<p>a 取算术平均、b 取几何平均，两者以惊人的速度彼此靠近（共同极限叫「算术几何平均数」AGM）。关键性质与牛顿同款：<b>二次收敛，一致位数每轮翻倍</b>——一亿位只要 26 轮，且每轮都是整片数组级别的大运算，正是 GPU 喜欢的负载形状：</p>
+<figure><svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12" role="img"><text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">a、b 一致的十进制位数逐轮翻倍（对数刻度）——第 26 轮后触发一亿位的终止判据</text><line x1="70" y1="40" x2="70" y2="240" stroke="#999"/><line x1="70" y1="240" x2="830" y2="240" stroke="#999"/><line x1="66" y1="240" x2="70" y2="240" stroke="#999"/><text x="62" y="244" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">0</tspan></text><line x1="66" y1="192" x2="70" y2="192" stroke="#999"/><text x="62" y="196" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">2</tspan></text><line x1="66" y1="145" x2="70" y2="145" stroke="#999"/><text x="62" y="149" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">4</tspan></text><line x1="66" y1="98" x2="70" y2="98" stroke="#999"/><text x="62" y="102" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">6</tspan></text><line x1="66" y1="50" x2="70" y2="50" stroke="#999"/><text x="62" y="54" font-size="11" text-anchor="end" fill="#555">10<tspan baseline-shift="super" font-size="8">8</tspan></text><line x1="70" y1="57" x2="830" y2="57" stroke="#c07a3a" stroke-width="1.5" stroke-dasharray="6 4"/><text x="82" y="51" font-size="11" fill="#c07a3a">终止判据 2g ≥ p+30（g ≈ 5×10⁷）</text><polyline points="98.5,236.8 126.9,229.6 155.4,222.5 183.8,215.3 212.3,208.2 240.8,201.0 269.2,193.9 297.7,186.7 326.2,179.6 354.6,172.5 383.1,165.3 411.5,158.2 440.0,151.0 468.5,143.9 496.9,136.7 525.4,129.6 553.8,122.4 582.3,115.3 610.8,108.1 639.2,101.0 667.7,93.8 696.2,86.7 724.6,79.5 753.1,72.4 781.5,65.2 810.0,58.1" fill="none" stroke="#2c5f8f" stroke-width="2"/><circle cx="98.5" cy="236.8" r="3.5" fill="#2c5f8f"><title>第 1 轮 ≈ 1 位</title></circle><text x="98.5" y="256" font-size="11" text-anchor="middle" fill="#555">1</text><circle cx="126.9" cy="229.6" r="3.5" fill="#2c5f8f"><title>第 2 轮 ≈ 2 位</title></circle><circle cx="155.4" cy="222.5" r="3.5" fill="#2c5f8f"><title>第 3 轮 ≈ 5 位</title></circle><circle cx="183.8" cy="215.3" r="3.5" fill="#2c5f8f"><title>第 4 轮 ≈ 10 位</title></circle><text x="183.8" y="256" font-size="11" text-anchor="middle" fill="#555">4</text><circle cx="212.3" cy="208.2" r="3.5" fill="#2c5f8f"><title>第 5 轮 ≈ 21 位</title></circle><circle cx="240.8" cy="201.0" r="3.5" fill="#2c5f8f"><title>第 6 轮 ≈ 43 位</title></circle><circle cx="269.2" cy="193.9" r="3.5" fill="#2c5f8f"><title>第 7 轮 ≈ 87 位</title></circle><circle cx="297.7" cy="186.7" r="3.5" fill="#2c5f8f"><title>第 8 轮 ≈ 174 位</title></circle><text x="297.7" y="256" font-size="11" text-anchor="middle" fill="#555">8</text><circle cx="326.2" cy="179.6" r="3.5" fill="#2c5f8f"><title>第 9 轮 ≈ 349 位</title></circle><circle cx="354.6" cy="172.5" r="3.5" fill="#2c5f8f"><title>第 10 轮 ≈ 698 位</title></circle><circle cx="383.1" cy="165.3" r="3.5" fill="#2c5f8f"><title>第 11 轮 ≈ 1,397 位</title></circle><circle cx="411.5" cy="158.2" r="3.5" fill="#2c5f8f"><title>第 12 轮 ≈ 2,794 位</title></circle><text x="411.5" y="256" font-size="11" text-anchor="middle" fill="#555">12</text><circle cx="440.0" cy="151.0" r="3.5" fill="#2c5f8f"><title>第 13 轮 ≈ 5,588 位</title></circle><circle cx="468.5" cy="143.9" r="3.5" fill="#2c5f8f"><title>第 14 轮 ≈ 11,176 位</title></circle><circle cx="496.9" cy="136.7" r="3.5" fill="#2c5f8f"><title>第 15 轮 ≈ 22,353 位</title></circle><circle cx="525.4" cy="129.6" r="3.5" fill="#2c5f8f"><title>第 16 轮 ≈ 44,707 位</title></circle><text x="525.4" y="256" font-size="11" text-anchor="middle" fill="#555">16</text><circle cx="553.8" cy="122.4" r="3.5" fill="#2c5f8f"><title>第 17 轮 ≈ 89,415 位</title></circle><circle cx="582.3" cy="115.3" r="3.5" fill="#2c5f8f"><title>第 18 轮 ≈ 178,831 位</title></circle><circle cx="610.8" cy="108.1" r="3.5" fill="#2c5f8f"><title>第 19 轮 ≈ 357,663 位</title></circle><circle cx="639.2" cy="101.0" r="3.5" fill="#2c5f8f"><title>第 20 轮 ≈ 715,326 位</title></circle><text x="639.2" y="256" font-size="11" text-anchor="middle" fill="#555">20</text><circle cx="667.7" cy="93.8" r="3.5" fill="#2c5f8f"><title>第 21 轮 ≈ 1,430,652 位</title></circle><circle cx="696.2" cy="86.7" r="3.5" fill="#2c5f8f"><title>第 22 轮 ≈ 2,861,304 位</title></circle><circle cx="724.6" cy="79.5" r="3.5" fill="#2c5f8f"><title>第 23 轮 ≈ 5,722,608 位</title></circle><circle cx="753.1" cy="72.4" r="3.5" fill="#2c5f8f"><title>第 24 轮 ≈ 11,445,217 位</title></circle><text x="753.1" y="256" font-size="11" text-anchor="middle" fill="#555">24</text><circle cx="781.5" cy="65.2" r="3.5" fill="#2c5f8f"><title>第 25 轮 ≈ 22,890,435 位</title></circle><circle cx="810.0" cy="58.1" r="3.5" fill="#2c5f8f"><title>第 26 轮 ≈ 45,780,870 位</title></circle><text x="800.0" y="50.1" font-size="11" text-anchor="end" fill="#2c5f8f">实测锚点：第 26 轮入口 45,780,870 位（该轮翻倍后越线）</text><text x="430" y="292" font-size="11.5" text-anchor="middle" fill="#5b6b7b">曲线为由该锚点按「每轮翻倍」反推的理论轨迹；横轴为迭代轮数</text></svg><figcaption>图 5：一致位数逐轮翻倍。第 26 轮开始时实测一致 45,780,870 位；该轮执行后翻倍到约 9,156 万位、越过阈值，2g ≥ p+30 的终止判据在下一次检查时触发（曲线为按二次收敛律从该锚点反推的理论轨迹）。</figcaption></figure>
+<p>代价同样明确：<b>每一轮都要在一亿位精度上开一次平方根</b>（b′=√(ab)），收尾还有一次同精度除法。这个算法能不能快，完全取决于大数乘法有多快、牛顿迭代做得聪明不聪明——正好把压力全部传导给我们的基础设施。</p>
+<p><b>定点缩放</b>解决「实数进整数库」：所有量一律乘 10<sup>p</sup> 存成整数（p = 100,000,050，3 的倍数 → 恰好 33,333,350 个 limb）。每个实数运算都严格对应一个整数运算：</p>
+<table><tr><th>实数世界</th><th>定点整数世界（一切 ×10<sup>p</sup>）</th><th>用到的原语</th></tr><tr><td>(a+b)/2</td><td>(A+B)/2</td><td>加法 + 偶基取半（无进位传播）</td></tr><tr><td>√(a·b)</td><td>isqrt(A·B)：A·B 带 10<sup>2p</sup>，开方后恰好回到 10<sup>p</sup></td><td>乘法 + 牛顿开方</td></tr><tr><td>t − p·(a−a′)²</td><td>T − pₙ·(D² 右移 p 位)</td><td>乘法 + 移位（丢低位=截断）</td></tr><tr><td>(a+b)²/(4t)</td><td>(A+B)²·recip(4T) 再右移</td><td>乘法 + 牛顿倒数</td></tr></table>
+<p>截断误差每轮只污染最低几位，26 轮累计远小于 50 位保护位（先在小规模上逐位验证过再上一亿）。主循环的骨架：</p>
+<pre class="code"><code># 节选自 pi-numba/pi_agm.py —— run_pi 的 AGM 主循环：4 个常驻槽位复用显存，每轮回收临时量
+    slotA = C.g_arena.alloc(slot_cap * 4, C.LIMB_DT)
+    slotB = C.g_arena.alloc(slot_cap * 4, C.LIMB_DT)
+    slotT = C.g_arena.alloc(slot_cap * 4, C.LIMB_DT)
+    slotY = C.g_arena.alloc(slot_cap * 4, C.LIMB_DT)
+    ...
+    mark0 = C.g_arena.save()
+    ...
+    while True:
+        ...
+        C.g_arena.restore(mark0)
+        ...
+        agree = LOGB * (Lp - diff.len)
+        if 2 * agree >= p + 30:
+            break
+        ...
+        K = F.big_mul(A, Bv)
+        Bn, yn = NW.rsqrt_ramp_cu(K, y, agree - 9 if agree > 9 else 0, nsteps)
+        A = C.keep_into(slotA, A2, slot_cap)
+        Bv = C.keep_into(slotB, Bn, slot_cap)
+        T = C.keep_into(slotT, Tn, slot_cap)
+    ...</code></pre>
+<h2 id="c9">9. 牛顿的两件武器：精度爬升与热启动</h2>
+<p>牛顿开方如果只做一次，怎么写都行；但 AGM 每轮都来，加上初始化共 27 次。如果每步牛顿都在全精度上做乘法，一次开方 ≈ 23 步全尺寸大乘法，27 次开方 ≈ 600 多步——足以吞掉换算法省下的一切。两件标准武器：</p>
+<h3>9.1 精度爬升（ramping）</h3>
+<p>牛顿第 k 步只有约 2<sup>k</sup> 位是正确的——那就别在全精度上白算！把精度分成层级（每层 limb 数翻倍），最低层用 Python 大整数（<code>math.isqrt</code>）精确播种，然后逐层上爬：每层只取 K 的最高 m 个 limb 参与运算，做一步牛顿恰好把正确位数从「半层」推到「全层」。因为每层运算量是上一层的两倍，总代价 ≈ 最后一层的 2 倍——<b>一次开方 ≈ 常数次全尺寸乘法</b>。</p>
+<h3>9.2 热启动（warm start）</h3>
+<p>相邻两轮的 K = aₙbₙ 高位几乎一样（第 n 轮已一致 ~2<sup>n</sup> 位），而牛顿的中间量 y ≈ 1/√K 我们本来就留着——把上一轮的 y 直接当种子，跳过大部分爬升层级。最后一层照例迭代到修正量为零，天然自我纠错：就算热启动过于乐观，也只是多做一两步，不会算错。还有一个小而准的收尾优化：当修正量长度不足 y 的一半时，二次收敛保证下一步修正必然小于 1 ulp——<b>确认步可以直接免掉</b>。这一条把全程牛顿步数从 479 压到 443，大乘法从 1145 次压到 1062 次：</p>
+<pre class="code"><code># 节选自 pi-numba/newton.py —— rsqrt_ramp_cu：精度爬升 + 热启动跳层 + 免确认步
+    levels = ramp_levels(dk, True, 4)
+    ...
+    if warm is not None and warm.len > 0 and warm_digits >= 36:
+        ...
+        if cand >= 0:
+            start = cand
+            m0 = levels[start]
+            y0 = big_shr(warm, (dk - m0) // 2) if m0 &lt; dk else warm
+            y = keep_into(yslot, y0, yslot_cap)
+    ...
+    for idx in range(start, len(levels)):
+        m = levels[idx]
+        ...
+        for _ in range(max_steps):
+            ...
+            delta = big_half(semantic_mul_shr(y, rr, 2 * hm, "rsqrt_y_rr"))
+            ...
+            if delta.len * 2 &lt; y.len:
+                break
+    s = strip(semantic_mul_shr(K, y, h, "rsqrt_K_y"))
+    return s, y</code></pre>
+<p>效果直接体现在每轮耗时上（26 轮 AGM 迭代全列）：</p>
+<table><tr><th>轮次</th><td class="num">1</td><td class="num">2</td><td class="num">3</td><td class="num">4</td><td class="num">5</td><td class="num">6</td><td class="num">7</td><td class="num">8</td><td class="num">9</td><td class="num">10</td><td class="num">11</td><td class="num">12</td><td class="num">13</td></tr><tr><th>耗时(s)</th><td class="num">0.220</td><td class="num">0.218</td><td class="num">0.217</td><td class="num">0.217</td><td class="num">0.217</td><td class="num">0.217</td><td class="num">0.210</td><td class="num">0.208</td><td class="num">0.205</td><td class="num">0.203</td><td class="num">0.200</td><td class="num">0.197</td><td class="num">0.194</td></tr></table>
+<table><tr><th>轮次</th><td class="num">14</td><td class="num">15</td><td class="num">16</td><td class="num">17</td><td class="num">18</td><td class="num">19</td><td class="num">20</td><td class="num">21</td><td class="num">22</td><td class="num">23</td><td class="num">24</td><td class="num">25</td><td class="num">26</td></tr><tr><th>耗时(s)</th><td class="num">0.191</td><td class="num">0.188</td><td class="num">0.184</td><td class="num">0.180</td><td class="num">0.177</td><td class="num">0.173</td><td class="num">0.169</td><td class="num">0.165</td><td class="num">0.160</td><td class="num">0.156</td><td class="num">0.152</td><td class="num">0.146</td><td class="num">0.137</td></tr></table>
+<p>每轮 0.14～0.22 秒，从 0.220 平滑降到 0.137——热启动的种子随一致位数增长越来越准，爬升层级越来越省；更要紧的是没有暖机、没有首轮尖峰：JIT 的账单全部付在预热里。这条「无启动税」的曲线，在第 14 节结算 Python 发射税时会再次出场作证。</p>
+<h2 id="c10">10. 一个线程块里的 2048 点 FFT</h2>
+<p>从这一节起，主角登场。先把第 3 节尝过一口的「菜谱」正式端上桌：cuFFTDx 的一切配置——变换多大、什么精度、正向还是逆向、每块做几批、在块级执行——在 nvmath-python 里就是一份关键字参数表，一次普通的 Python 函数调用拼成一个 FFT <b>描述符</b>。全项目所有 FFT 菜谱都从同一座小工厂出锅：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— 「菜谱」工厂：一次函数调用拼配料，返回 FFT 描述符
+from nvmath.device import FFT as DxFFT
+
+def _dx(size, inv, fpb, ept=None):
+    kw = dict(fft_type="c2c", size=size, precision=np.float64,   # 配料：复数变换、多大、fp64
+              direction=("inverse" if inv else "forward"),        # 正向 / 逆向
+              ffts_per_block=fpb, execution="Block")              # 每块几批、块级执行
+    if ept is not None:
+        kw["elements_per_thread"] = ept                           # 不指定就让库自选最优值
+    return DxFFT(**kw)                                            # ← 一张菜谱，不发射任何 kernel</code></pre>
+<p>和「先建 plan 再打电话」的旧模型最大的不同：这个描述符不替你做任何事——它是一张<b>菜谱</b>。构造发生在 Python 运行期，但拿到手的一刻，菜谱就把「厨房该怎么开」全部告诉你：<code>storage_size</code> 是每线程要备几格寄存器、<code>elements_per_thread</code>/<code>stride</code> 是装载循环的趟数与交错步幅、<code>value_type</code> 是寄存器与共享内存数组的元素类型、<code>block_dim</code>/<code>shared_memory_size</code> 是发射时的块形与工作区大小。这些 traits 会以 Python 常量的身份被闭包捕获进 CUDA kernel——Numba 编译那一刻全部折叠成常量，生成的机器码与把数字写死没有两样。「菜谱在先、厨房照单」的思想一点没变，只是拼菜谱的动作从此发生在构造期：</p>
+<figure><svg viewBox="0 0 860 268" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah6p" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">「构造期菜谱」：关键字参数拼配料，厨房布局由描述符的 traits 推导</text>
+<rect x="26" y="38" width="110" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="81" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">fft_type="c2c"</text><rect x="144" y="38" width="80" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="184" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">size=2048</text><rect x="232" y="38" width="160" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="312" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">precision=np.float64</text>
+<rect x="400" y="38" width="146" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="473" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">direction="forward"</text><rect x="554" y="38" width="126" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="617" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">ffts_per_block=1</text><rect x="688" y="38" width="132" height="32" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="754" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">execution="Block"</text>
+<line x1="430" y1="76" x2="430" y2="96" stroke="#666" marker-end="url(#ah6p)"/>
+<rect x="220" y="100" width="420" height="40" rx="6" fill="#eaf6ec" stroke="#1c7c3c"/><text x="430" y="117" text-anchor="middle" font-family="monospace">fft = DxFFT(**kw)</text><text x="430" y="133" text-anchor="middle" font-size="11" fill="#5b6b7b">nvmath.device.FFT 描述符——Python 运行期构造，不发射任何 kernel</text>
+<line x1="430" y1="140" x2="160" y2="168" stroke="#666" marker-end="url(#ah6p)"/><line x1="430" y1="140" x2="430" y2="168" stroke="#666" marker-end="url(#ah6p)"/><line x1="430" y1="140" x2="700" y2="168" stroke="#666" marker-end="url(#ah6p)"/>
+<rect x="40" y="172" width="240" height="54" rx="6" fill="#eef3fa" stroke="#666"/><text x="160" y="192" text-anchor="middle" font-family="monospace" font-size="11.5">storage_size · value_type</text><text x="160" y="212" text-anchor="middle" font-size="11" fill="#5b6b7b">每线程寄存器数组 rd 的长度与类型</text><rect x="310" y="172" width="240" height="54" rx="6" fill="#eef3fa" stroke="#666"/><text x="430" y="192" text-anchor="middle" font-family="monospace" font-size="11.5">elements_per_thread · stride</text><text x="430" y="212" text-anchor="middle" font-size="11" fill="#5b6b7b">装载/写回循环的趟数与交错步幅</text><rect x="580" y="172" width="240" height="54" rx="6" fill="#eef3fa" stroke="#666"/><text x="700" y="192" text-anchor="middle" font-family="monospace" font-size="11.5">block_dim · shared_memory_size</text><text x="700" y="212" text-anchor="middle" font-size="11" fill="#5b6b7b">发射参数：块形与共享内存工作区</text>
+<text x="430" y="254" text-anchor="middle" font-size="12.5" fill="#222">traits 以 Python 常量身份被闭包捕获进 CUDA kernel——编译那一刻全部折叠成常量，机器码里再无一次运行期查询</text>
+</svg><figcaption>图 6：「构造期菜谱」。配料改用关键字参数，一次函数调用拼出描述符；描述符导出的 traits 反过来告诉你该开多大的厨房——寄存器、循环形状、块形、共享内存全部由菜谱推导，进了 kernel 就全是常量。</figcaption></figure>
+<p>于是 kernel 的正确写法是一座<b>工厂函数</b>：先构造描述符、读出 traits，再在函数体内定义 CUDA kernel，让闭包把这些常量焊进去。下面是本项目 P 级的 kernel B——每个线程块负责一行 2048 点 fp64 复数 FFT，装载/写回相位顺手乘上四步法的外层 twiddle（为什么要乘、乘的是什么角度，第 11 节展开）：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— kernel B（P 级）：每块一行 2048 点 FFT ＋ 外层 twiddle
+def make_stageB(inv):
+    fft = _dx(FFT_P, inv, 1)                    # FFT_P = 2048，每块 1 批
+    st, ept, stride = fft.storage_size, fft.elements_per_thread, fft.stride
+    vt = fft.value_type
+    IS_INV = inv                                # ↑ 读出 traits：闭包捕获，编译时折叠成常量
+
+    @cuda.jit
+    def k_stageB(data, N, rowStride):
+        rd = cuda.local.array(shape=(st,), dtype=vt)   # 数据住在你的寄存器里
+        sm = cuda.shared.array(shape=(0,), dtype=vt)   # 动态共享内存：库的工作区
+        j = cuda.blockIdx.x                            # 本块负责第 j 行
+        base = cuda.blockIdx.y * rowStride + j * FFT_P
+        invN2 = 2.0 / N
+        for i in range(ept):                           # 装载相位：你写的循环
+            e = cuda.threadIdx.x + i * stride
+            if e &lt; FFT_P:
+                v = data[base + e]
+                if IS_INV:
+                    sn, cs = libdevice.sincospi((j * e) * invN2)
+                    v = v * complex(cs, sn)            # 逆变换：装载时顺手乘 twiddle
+                rd[i] = v
+        fft.execute(rd, sm)                            # ← 库在这儿：一行完成 2048 点 FFT
+        for i in range(ept):                           # 写回相位：也是你写的循环
+            e = cuda.threadIdx.x + i * stride
+            if e &lt; FFT_P:
+                v = rd[i]
+                if not IS_INV:
+                    sn, cs = libdevice.sincospi(-(j * e) * invN2)
+                    v = v * complex(cs, sn)            # 正变换：写回时顺手乘 twiddle
+                data[base + e] = v
+
+    return k_stageB, fft                               # kernel 与菜谱一起交给发射方</code></pre>
+<p>几个值得停下来看的细节：<b>装载的形状是库定的登记表</b>——每线程管 <code>ept</code> 个元素、彼此以 <code>stride</code> 交错（<code>e = threadIdx.x + i·stride</code>），装载与写回照抄这张表，<code>execute</code> 才认账（<code>if e &lt; FFT_P</code> 是通用护栏，防某些配置下 ept·stride 越过行尾）；<b><code>fft.execute(rd, sm)</code> 一行</b>——编进你 kernel 里的一次块内设备端调用，不发射新 kernel，2048 点蝶形借共享内存就地完成，结果仍回寄存器 <code>rd</code>；<b>方向分叉在工厂里就消失了</b>——<code>IS_INV</code> 是闭包常量，正、逆两个 kernel 各自编译，机器码里没有一条运行期分支：</p>
+<figure><svg viewBox="0 0 860 258" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah7p" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">kernel B 内部：一行 2048 点 fp64 复数 FFT，在一个线程块里就地完成</text>
+<rect x="20" y="44" width="168" height="104" rx="6" fill="#eef3fa" stroke="#666"/><text x="104" y="64" text-anchor="middle">显存：第 j 行</text><text x="104" y="84" text-anchor="middle">2048 个复数</text><text x="104" y="106" text-anchor="middle" font-family="monospace" font-size="11">base = by·rowStride</text><text x="104" y="121" text-anchor="middle" font-family="monospace" font-size="11">+ j·2048</text><text x="104" y="140" text-anchor="middle" font-size="11" fill="#5b6b7b">网格 (Q, R)：每块一行</text>
+<line x1="190" y1="96" x2="232" y2="96" stroke="#666" marker-end="url(#ah7p)"/><text x="211" y="84" text-anchor="middle" font-size="11" fill="#2c5f8f">装载相位</text><text x="211" y="112" text-anchor="middle" font-size="11" fill="#5b6b7b">逆:×twiddle</text><rect x="234" y="44" width="172" height="104" rx="6" fill="#eaf6ec" stroke="#666"/><text x="320" y="64" text-anchor="middle">寄存器（每线程）</text><text x="320" y="86" text-anchor="middle" font-family="monospace" font-size="11">rd = local.array(st)</text><text x="320" y="106" text-anchor="middle" font-family="monospace" font-size="11">e = tx + i·stride</text><text x="320" y="128" text-anchor="middle" font-size="11" fill="#5b6b7b">ept 个/线程，stride 交错</text>
+<line x1="408" y1="96" x2="450" y2="96" stroke="#666" marker-end="url(#ah7p)"/><rect x="452" y="44" width="196" height="104" rx="6" fill="#fdeeee" stroke="#666"/><text x="550" y="64" text-anchor="middle" font-family="monospace" font-size="11.5">fft.execute(rd, sm)</text><text x="550" y="86" text-anchor="middle">2048 点蝶形就地完成</text><text x="550" y="106" text-anchor="middle" font-size="11">sm：动态共享内存工作区</text><text x="550" y="122" text-anchor="middle" font-size="11" fill="#5b6b7b">shared_memory_size 字节</text><text x="550" y="138" text-anchor="middle" font-size="11" fill="#5b6b7b">结果回到寄存器 rd</text>
+<line x1="650" y1="96" x2="692" y2="96" stroke="#666" marker-end="url(#ah7p)"/><text x="671" y="84" text-anchor="middle" font-size="11" fill="#2c5f8f">写回相位</text><text x="671" y="112" text-anchor="middle" font-size="11" fill="#5b6b7b">正:×twiddle</text><rect x="694" y="44" width="146" height="104" rx="6" fill="#faf0e6" stroke="#666"/><text x="767" y="68" text-anchor="middle">显存：同一行</text><text x="767" y="92" text-anchor="middle">原位覆盖</text><text x="767" y="118" text-anchor="middle" font-size="11" fill="#5b6b7b">全程一次显存进出</text>
+<text x="430" y="176" text-anchor="middle" font-size="11.5" fill="#222">2048 点按 stride 交错分摊——线程 t 负责 e = t, t+stride, t+2·stride, …</text><rect x="60" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="92" y="203" text-anchor="middle" font-family="monospace" font-size="11">t0</text><rect x="128" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="160" y="203" text-anchor="middle" font-family="monospace" font-size="11">t1</text><rect x="196" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="228" y="203" text-anchor="middle" font-family="monospace" font-size="11">t2</text><rect x="264" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="296" y="203" text-anchor="middle" font-family="monospace" font-size="11">⋯</text><rect x="332" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="364" y="203" text-anchor="middle" font-family="monospace" font-size="11">t(S−1)</text><rect x="400" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="432" y="203" text-anchor="middle" font-family="monospace" font-size="11">t0</text><rect x="468" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="500" y="203" text-anchor="middle" font-family="monospace" font-size="11">t1</text><rect x="536" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="568" y="203" text-anchor="middle" font-family="monospace" font-size="11">t2</text><rect x="604" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="636" y="203" text-anchor="middle" font-family="monospace" font-size="11">⋯</text><rect x="672" y="186" width="64" height="26" rx="4" fill="#eef4ff" stroke="#9db8f0"/><text x="704" y="203" text-anchor="middle" font-family="monospace" font-size="11">t(S−1)</text><text x="775" y="203" font-size="11" fill="#5b6b7b">⋯ 共 ept 趟</text>
+<text x="228" y="230" text-anchor="middle" font-size="11" fill="#5b6b7b">第 1 趟（i=0）：e = 0 … stride−1</text><text x="568" y="230" text-anchor="middle" font-size="11" fill="#5b6b7b">第 2 趟（i=1）：e = stride … 2·stride−1</text><text x="430" y="250" text-anchor="middle" font-size="11.5" fill="#5b6b7b">块形与共享内存直接取自菜谱（fft.block_dim / fft.shared_memory_size）；探路脚本 probe.py 曾固定 ept=8 验证此形状：256 线程 × 每线程 8 个复数</text>
+</svg><figcaption>图 7：kernel B 数据流。装载相位把一行 2048 点按 stride 交错读进各线程的寄存器（逆变换顺手乘 twiddle），fft.execute 借共享内存完成块内蝶形，写回相位（正变换顺手乘 twiddle）原位覆盖——全程一个线程块、一次显存进出。</figcaption></figure>
+<p><b>twiddle 精度</b>也必须较真：所有相位的分母都是 2 的幂——<code>invN2 = 2.0/N</code> 在二进制里是精确值，<code>j·e</code> 是不超过 2<sup>22</sup> 的整数，乘积一位不丢；<code>libdevice.sincospi</code> 自带精确 π 归约，一次调用同时给出正弦与余弦（Python 侧直接解包成 <code>sn, cs</code>，再用 <code>v * complex(cs, sn)</code> 完成旋转），每个 twiddle 误差 ≤1 ulp——不查表、不累积、现场算。这份「便宜的严谨」正是第 6 节 0.25 红线预算表里最省心的一项。</p>
+<p>最后一步，菜谱反过来告诉你厨房开多大——发射参数一个字都不用自己算，照单全收：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— 发射：网格 (Q, R) 每块一行，块形与共享内存照抄菜谱
+def run_stageB(buf, inv, Q, N, R=1, rowStride=0):
+    k, fft = _get(("B", inv), lambda: make_stageB(inv))      # 工厂结果缓存：每种配置只建一次
+    launch(k, (int(Q), int(R)), fft.block_dim, fft.shared_memory_size, buf, float(N), int64(rowStride))</code></pre>
+<div class="callout">「描述符工厂 + traits 折叠 + 缓存」这个三件套是全篇 FFT 侧的地基：同一个 <code>_dx</code> 之后还要为 Q 点行 FFT（kernel D）、R 点外层 FFT 乃至第 17 节「正逆两份描述符同锅」的频域三合一反复出锅，<code>_get</code>/<code>_kcache</code> 保证每种配置只编译一次——「一次编译、处处发射」在第 14 节结算 Python 发射税时是一句关键证词；拼出来的东西对不对，则由第 19 节的验证梯子把关。单块的天花板依旧存在：fp64 复数一个线程块只装得下几千点，而一亿位 π 需要 2<sup>28</sup>——下一节就把这块 2048 点的积木拼成大厦。</div>
+<h2 id="c11">11. 超出一个块：四步法、三级分解，与从不重排的频谱</h2>
+<p>cuFFTDx 的天花板是「一个线程块装得下」：fp64 复数几千点。而一亿位 π 的大乘法需要 N = 2<sup>28</sup>。经典解法是<b>四步法</b>：把长度 N = P·Q 的数组看成 P×Q 矩阵（n = Q·i + j），DFT 精确拆成两轮小 FFT 夹一个逐点相位：</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>X</mi><mo>[</mo><msub><mi>k</mi><mi>i</mi></msub><mo>+</mo><mi>P</mi><msub><mi>k</mi><mi>j</mi></msub><mo>]</mo><mo>=</mo><munder><mo>&#8721;</mo><mi>j</mi></munder><msubsup><mi>W</mi><mi>Q</mi><mrow><mi>j</mi><msub><mi>k</mi><mi>j</mi></msub></mrow></msubsup><mo>&#8901;</mo><msubsup><mi>W</mi><mi>N</mi><mrow><mi>j</mi><msub><mi>k</mi><mi>i</mi></msub></mrow></msubsup><mo>&#8901;</mo><mrow><mo>(</mo><munder><mo>&#8721;</mo><mi>i</mi></munder><mi>x</mi><mo>[</mo><mi>Q</mi><mi>i</mi><mo>+</mo><mi>j</mi><mo>]</mo><msubsup><mi>W</mi><mi>P</mi><mrow><mi>i</mi><msub><mi>k</mi><mi>i</mi></msub></mrow></msubsup><mo>)</mo></mrow></mrow></math></div>
+<figure><svg viewBox="0 0 860 250" role="img"><defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs><text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">四步法：把 N=P·Q 点的大 FFT 拆成两轮「每行一个小 FFT」+ 两次转置</text><rect x="20" y="60" width="130" height="130" rx="6" fill="#eef3fa" stroke="#666"/><text x="85" y="75" font-size="12" text-anchor="middle" fill="#222">输入（自然序）</text><text x="85" y="125" font-size="12" text-anchor="middle" fill="#222">P×Q 矩阵</text><text x="85" y="145" font-size="11" text-anchor="middle" fill="#222">n = Q·i + j</text><line x1="152" y1="125" x2="195" y2="125" stroke="#666" marker-end="url(#ah)"/><text x="173" y="112" font-size="11" text-anchor="middle" fill="#222">转置</text><rect x="197" y="60" width="160" height="130" rx="6" fill="#eaf6ec" stroke="#666"/><text x="277" y="75" font-size="12" text-anchor="middle" fill="#222">kernel B（每行一块）</text><text x="277" y="125" font-size="12" text-anchor="middle" fill="#222">Q 行 × 2048 点 FFT</text><text x="277" y="145" font-size="11" text-anchor="middle" fill="#222">cuFFTDx</text><text x="277" y="165" font-size="11" text-anchor="middle" fill="#222">＋外 twiddle</text><line x1="359" y1="125" x2="402" y2="125" stroke="#666" marker-end="url(#ah)"/><text x="380" y="112" font-size="11" text-anchor="middle" fill="#222">转置</text><rect x="404" y="60" width="150" height="130" rx="6" fill="#eef3fa" stroke="#666"/><text x="479" y="75" font-size="12" text-anchor="middle" fill="#222">kernel D</text><text x="479" y="125" font-size="12" text-anchor="middle" fill="#222">2048 行 × Q 点 FFT</text><text x="479" y="145" font-size="11" text-anchor="middle" fill="#222">cuFFTDx</text><line x1="556" y1="125" x2="599" y2="125" stroke="#666" marker-end="url(#ah)"/><rect x="601" y="60" width="130" height="130" rx="6" fill="#faf0e6" stroke="#666"/><text x="666" y="75" font-size="12" text-anchor="middle" fill="#222">频谱（置乱序 σ）</text><text x="666" y="125" font-size="12" text-anchor="middle" fill="#222">点乘不看座位号</text><text x="666" y="145" font-size="11" text-anchor="middle" fill="#222">从不重排！</text><text x="430" y="225" font-size="12" text-anchor="middle" fill="#222">逆变换 = 完全镜像（D′ → 转置 → B′ → 转置），置乱序在正逆之间自然抵消</text></svg><figcaption>图 8：四步法数据流。P 固定 2048（kernel B），Q = N/2048 ∈ {4…2048}，覆盖 N ≤ 2<sup>22</sup>。</figcaption></figure>
+<p>N 再大，就把「内层 2<sup>22</sup>」当成新的积木再拆一层——<b>三级分解</b> N = 2<sup>22</sup> × R（R ≤ 64），覆盖到 2<sup>28</sup>：</p>
+<figure><svg viewBox="0 0 860 240" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">三级分解：2^28 = R × 2^22 = R × (2048 × 2048)，每级都是「每行一个小 FFT」</text>
+<rect x="30" y="40" width="800" height="60" rx="8" fill="#eef3fa" stroke="#666"/>
+<text x="120" y="65" font-size="13">R 级（外层）</text><text x="120" y="84" fill="#5b6b7b" font-size="11">R ≤ 64 点 FFT</text>
+<text x="520" y="65" font-family="monospace">k_stageR_fused：R 点 FFT × 2^22 批（cuFFTDx）</text>
+<text x="520" y="84" fill="#5b6b7b" font-size="11">＋外层 twiddle 转置（第 15 节：融合进装载相位）</text>
+<rect x="30" y="112" width="800" height="60" rx="8" fill="#eaf6ec" stroke="#666"/>
+<text x="120" y="137" font-size="13">D 级（中层）</text><text x="120" y="156" fill="#5b6b7b" font-size="11">Q = 2048 点 FFT</text>
+<text x="520" y="137" font-family="monospace">k_stageD：2048 点 FFT × R·2048 行（cuFFTDx）</text>
+<text x="520" y="156" fill="#5b6b7b" font-size="11">R 行批量一次发射（blockIdx.y/z）</text>
+<rect x="30" y="184" width="800" height="48" rx="8" fill="#fdeeee" stroke="#666"/>
+<text x="120" y="205" font-size="13">B 级（内层）</text><text x="120" y="222" fill="#5b6b7b" font-size="11">P = 2048 点 FFT</text>
+<text x="520" y="205" font-family="monospace">k_stageB：2048 点 FFT（cuFFTDx）</text>
+<text x="520" y="222" fill="#5b6b7b" font-size="11">第 10 节的主角：一个线程块内就地完成</text>
+</svg><figcaption>图 9：三级分解。每一级都是「每行一个小 FFT」，行内连续、行间独立——正是线程块的形状。</figcaption></figure>
+<p>这里有个省了大功夫的设计：kernel B 输出的频率顺序天然是「置乱」的（数位反转的混合序）。教科书做法是再加一趟全量重排恢复自然序——但我们的 FFT 只服务于卷积：正变换后马上逐点乘、马上逆变换。<b>逐点乘不看座位号</b>：只要正逆变换用同一套置乱序 σ，两个谱逐元素对齐即可，谁坐哪个位置根本无所谓——就像两批观众按同一张乱序座位表入座，配对关系一点不乱。于是重排一趟都不用做，逆变换就是正变换的严格镜像。唯一需要「查座位表」的场合是 2-for-1 解包（第 12 节）要找共轭伙伴 σ(N−k)，为此备一对便宜的映射函数：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— 置乱谱的「座位表」：存储序 σ ↔ 真实频率 k 的双向映射
+@cuda.jit(device=True)
+def ki_of_s(s, Qin):
+    pos = s // Qin
+    kq = s - pos * Qin
+    return pos + 2048 * kq
+
+@cuda.jit(device=True)
+def sigma_of_k(k, M, R, Qin):
+    kb = k // M
+    ka = k - kb * M
+    kq = ka >> 11
+    r = ka &amp; 2047
+    return (r * Qin + kq) * R + kb</code></pre>
+<p>工程上还有一个「工厂 + 缓存」的小福利：Q 和 R 是运行期才知道的值，而菜谱是构造期常量——按规格查一次缓存，十来种 Size 各自 specialize 成专用 kernel，Numba 对每一种单独编译优化：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— 运行期尺寸直接进描述符：nvmath 按需编译专用 FFT，工厂按 key 缓存
+def _dx(size, inv, fpb, ept=None):
+    kw = dict(fft_type="c2c", size=size, precision=np.float64,
+              direction=("inverse" if inv else "forward"),
+              ffts_per_block=fpb, execution="Block")
+    if ept is not None:
+        kw["elements_per_thread"] = ept
+    return DxFFT(**kw)
+
+_kcache = {}
+
+def _get(key, builder):
+    k = _kcache.get(key)
+    if k is None:
+        k = builder()
+        _kcache[key] = k
+    return k</code></pre>
+<p>到这里，完整流水线就通了：装载、三级正变换、逐点乘、三级逆变换、取整、进位——每一步一个（或几个）kernel，逻辑清晰，selftest 全绿，一亿位逐位正确。但「算得对」离「算得快」还有一整段路：这就是第 3 节那句「合同撕掉之后没人兜底」的另一面——自由是拿到了，但每一遍显存、每一次发射、每一个原子操作现在都是<b>你自己的</b>问题。把这条流水线交给 profiler，会看到一张意外的账单。接下来三节，就是按账单逐项施工的完整记录。</p>
+<h2 id="c12">12. 少搬字节：2-for-1 打包与装载融合</h2>
+<p>把这条流水线交给 profiler，第一张账单的大头是纯粹的<b>显存流量</b>。这一批改造全是「少搬字节」：<b>① 装载/twiddle 融合</b>——limb→复数的装载融进第一个转置、外层 twiddle 融进宽转置（融合思想的第一次小试牛刀，深水区在第 15 节）；<b>② 2-for-1 实数打包</b>——我们的输入都是实数序列，而复数 FFT 一次天然能装两个实数组：</p>
+<div class="mrow"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><mrow><mi>A</mi><mo>(</mo><mi>k</mi><mo>)</mo><mo>=</mo><mfrac><mrow><mi>Z</mi><mo>(</mo><mi>k</mi><mo>)</mo><mo>+</mo><mover><mi>Z</mi><mo>&#175;</mo></mover><mo>(</mo><mi>N</mi><mo>&#8722;</mo><mi>k</mi><mo>)</mo></mrow><mn>2</mn></mfrac><mo>,&#x2003;</mo><mi>B</mi><mo>(</mo><mi>k</mi><mo>)</mo><mo>=</mo><mfrac><mrow><mi>Z</mi><mo>(</mo><mi>k</mi><mo>)</mo><mo>&#8722;</mo><mover><mi>Z</mi><mo>&#175;</mo></mover><mo>(</mo><mi>N</mi><mo>&#8722;</mo><mi>k</mi><mo>)</mo></mrow><mrow><mn>2</mn><mi>i</mi></mrow></mfrac></mrow></math></div>
+<figure><svg viewBox="0 0 860 170" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah2f" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">2-for-1：一次复数 FFT 同时得到两个实数序列的谱</text>
+<rect x="20" y="46" width="130" height="34" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="85" y="67" text-anchor="middle">实数组 a</text>
+<rect x="20" y="96" width="130" height="34" rx="6" fill="#eef4ff" stroke="#9db8f0"/><text x="85" y="117" text-anchor="middle">实数组 b</text>
+<line x1="152" y1="63" x2="205" y2="80" stroke="#666" marker-end="url(#ah2f)"/>
+<line x1="152" y1="113" x2="205" y2="94" stroke="#666" marker-end="url(#ah2f)"/>
+<rect x="208" y="70" width="150" height="36" rx="6" fill="#eaf6ec" stroke="#666"/><text x="283" y="92" text-anchor="middle" font-family="monospace">z = a + i·b</text>
+<line x1="360" y1="88" x2="410" y2="88" stroke="#666" marker-end="url(#ah2f)"/><text x="385" y="78" text-anchor="middle" fill="#2c5f8f">一次 FFT</text>
+<rect x="412" y="70" width="110" height="36" rx="6" fill="#fdeeee" stroke="#666"/><text x="467" y="92" text-anchor="middle" font-family="monospace">谱 Z(k)</text>
+<line x1="524" y1="88" x2="574" y2="88" stroke="#666" marker-end="url(#ah2f)"/><text x="549" y="78" text-anchor="middle" fill="#2c5f8f">共轭拆解</text>
+<rect x="576" y="40" width="260" height="42" rx="6" fill="#fff" stroke="#666"/>
+<text x="706" y="58" text-anchor="middle" font-family="monospace" font-size="11.5">A(k) = (Z(k)+Z̄(N−k))/2</text>
+<text x="706" y="75" text-anchor="middle" fill="#5b6b7b" font-size="11">a 的谱</text>
+<rect x="576" y="94" width="260" height="42" rx="6" fill="#fff" stroke="#666"/>
+<text x="706" y="112" text-anchor="middle" font-family="monospace" font-size="11.5">B(k) = (Z(k)−Z̄(N−k))/2i</text>
+<text x="706" y="129" text-anchor="middle" fill="#5b6b7b" font-size="11">b 的谱</text>
+<text x="430" y="160" text-anchor="middle" fill="#5b6b7b" font-size="11.5">拆解与逐点乘 A(k)·B(k) 合在同一个 kernel（k_pw_2for1）里，正变换次数从 2 次降到 1 次</text>
+</svg><figcaption>图 10：2-for-1。两个不同数相乘（x·y，相对于平方 x²）的正变换次数从 2 次降到 1 次，解包与逐点乘合在一个 kernel 里。</figcaption></figure>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— k_pw_2for1：频域解包 + 逐点乘合在同一个 kernel（σ 主序迭代）
+@cuda.jit
+def k_pw_2for1(Z, N, M, R, Qin, invN):
+    ...
+    while s1 &lt; N:
+        kb = s1 % R
+        sa = s1 // R
+        k = ki_of_s(sa, Qin) + M * kb
+        if k &lt;= half:
+            ...
+                s2 = sigma_of_k(N - k, M, R, Qin)
+                z1 = Z[s1]
+                z2 = Z[s2]
+                ax = 0.5 * (z1.real + z2.real)
+                ay = 0.5 * (z1.imag - z2.imag)
+                bx = 0.5 * (z1.imag + z2.imag)
+                by = 0.5 * (z2.real - z1.real)
+                px = (ax * bx - ay * by) * invN
+                py = (ax * by + ay * bx) * invN
+                Z[s1] = complex(px, py)
+                Z[s2] = complex(px, -py)
+        s1 += stride</code></pre>
+<p><b>③ 牛顿免确认步</b>（机制见第 9 节）：全程大乘法 1145 → 1062 次——最贵的操作直接少做 7%。三项合计：主要数据通路的字节流量与正变换次数都接近<b>砍半</b>，且不碰任何计算逻辑。</p>
+<div class="callout"><b>格言一：访存主导的流水线里，「省字节」就是「省时间」。</b>2-for-1 一刀砍掉一半正变换；装载/twiddle 融合把搬运折进必经之路——刀刀都不碰计算逻辑。</div>
+<h2 id="c13">13. 少发射、合并访问：两阶段进位与访存形态</h2>
+<h3>13.1 kernel 发射也要钱</h3>
+<p>profiler 的下一个刺眼数字：一次一亿位计算要发射<b>两万六千多个 kernel</b>（基线 26,011 次——每次发射的「单价」问题留给第 14 节整章清算）。每次发射有几微秒的固定开销，更糟的是发射间隙 GPU 可能在空转。发射数的大头在移植时就被批量化设计压住（每级 FFT 的 R 行合成一次发射、blockIdx.y/z 铺开）；这里展开真正需要设计的两把斧子：<b>① 两阶段精确进位</b>——逐趟有界传播换成「段内串行精确 + 段间修正」两个 kernel，任意大系数一次收干净：</p>
+<pre class="code"><code># 节选自 pi-numba/common.py —— 两阶段精确进位：段内串行精确 + 段首修正，任意大系数两个 kernel 收干净
+@cuda.jit
+def k_carry_seg(inp, n, digits, segout):
+    ...
+    q = int64(0)
+    for k in range(CSEG):
+        v = sh[lo + k] + q
+        q = floordiv_b(v)
+        sh[lo + k] = v - q * LIMB_B
+    ...
+        segout[seg] = q
+@cuda.jit
+def k_carry_fix(digits, segout, n, res01):
+    ...
+    c = segout[seg - 1]
+    ...
+    while k &lt; CSEG and c != 0 and i + k &lt; n:
+        v = int64(digits[i + k]) + c
+        c = floordiv_b(v)
+        digits[i + k] = int32(v - c * LIMB_B)
+        k += 1
+    res01[seg] = int32(c)</code></pre>
+<p>收尾的前缀扫描就是第 5 节预告的<b>进位前瞻</b>：(g, p) 半群做成三 kernel 分块扫描——块内聚合 → 块间串链 → 应用——任意长的进/借位链 log₂n 趟布尔操作一次收干净，顺带消灭了逐趟传播里所有的主机同步。这套「段内精确 + 前瞻扫描」的组合是全程收益最大的修复之一，也是第 18 节进位流水线的地基。</p>
+<p><b>② one-hot 隐式操作数</b>——牛顿步里反复出现的 B<sup>g</sup>（1 后面 g 个 0）不再实体化成几百 MB 的数组：</p>
+<pre class="code"><code># 节选自 pi-numba/common.py —— one-hot 隐式操作数：B^g（1 后面 g 个 0）不物化，比较/相减时按位置现场生成
+@cuda.jit
+def k_diff_hi_onehot(x, nx, pos1, n, pos):
+    ...
+    while i &lt; n:
+        xv = x[i] if i &lt; nx else 0
+        yv = 1 if i == pos1 else 0
+        if xv != yv:
+            local = ((i + 1) &lt;&lt; 1) | (1 if xv > yv else 0)
+        i += stride
+    block_max_i64(local, pos, sh)
+
+@cuda.jit
+def k_sub_onehot(x, nx, pos1, n, sign, out):
+    i = cuda.grid(1)
+    stride = cuda.gridsize(1)
+    while i &lt; n:
+        xv = x[i] if i &lt; nx else 0
+        yv = 1 if i == pos1 else 0
+        out[i] = (yv - xv) if sign > 0 else (xv - yv)
+        i += stride</code></pre>
+
+<h3>13.2 让每一个字节都合并</h3>
+<p>发射的账记到台面上之后，profile 的焦点回到访存<b>形态</b>：同样的字节数，合并访问（相邻线程读相邻地址）与散射访问的带宽能差几倍。此时的头号热点正是 2-for-1 的解包 kernel——它按频率 k 主序迭代、按座位号 σ 散射访问，一度独占近三分之一的运行时间。把迭代变量换成 σ 本身（k 反查改用便宜的正向映射 ki_of_s），自身访问变成纯连续、共轭伙伴一侧也呈镜像连续段——榜首热点应声退位。配上扫描装载的共享内存整块化、T − pₙ·(d²≫p) 三合一 kernel 等零碎收尾。</p>
+
+<div class="callout"><b>格言二：发射数和访存形态是「整片数组」心法的另一半。</b>把循环改成整片运算只是开始；整片运算发射多少次、每个线程摸到的地址挨不挨着，决定它跑多快。</div>
+<h2 id="c14">14. Python 的发射税</h2>
+<h3>14.1 dispatcher：每次发射 40 µs 的海关</h3>
+<p>上一章数的是发射的<b>次数</b>，这一章数发射的<b>单价</b>。Numba 的 kernel 对象是一个 dispatcher：每次调用都要 configure 一遍网格参数、在 C 层做一遍类型匹配、再对每个 cupy 数组参数解析一次 <code>__cuda_array_interface__</code>，合计<b>每发射约 40 µs</b>——这是解释器世界特有的一道海关，收在 GPU 侧启动延迟之外。一次 1 亿位运行要发射 23,251 次 kernel，税单加总<b>约 1 秒量级</b>：kernel 没变、发射数也几乎没变（图 11），钱全花在 Python↔驱动的边境上。</p>
+<pre class="code"><code># 节选自 pi-numba/common.py —— 薄发射：预 specialize + overloads 直连，
+# 跳过 dispatcher 每次调用的 configure/typeof
+def prime(kern, *args):
+    """惰性 specialize + 缓存；返回可直接 .launch 的已编译 _Kernel。"""
+    krn = _spec_cache.get(kern)
+    if krn is None:
+        spec = kern.specialize(*args)
+        krn = next(iter(spec.overloads.values()))
+        _spec_cache[kern] = krn
+    return krn
+
+def launch(kern, grid, block, smem, *args):
+    g_cnt.launches += 1
+    args = tuple(_nb_twins.get(id(a), a) for a in args)   # 常驻缓冲 → numba 化身
+    prime(kern, *args).launch(args, _d3(grid), _d3(block), core_stream0(), smem)</code></pre>
+<p>对策不是绕开 Numba，而是<b>让它的慢路径只走一次</b>：<code>prime()</code> 首次调用时 specialize 并缓存已编译的 _Kernel，<code>launch()</code> 此后直连它的 <code>.launch</code> 入口，configure、类型匹配、参数解析三道手续整体出局。前提写在源码注释里：每个 kernel 的调用签名全程稳定（arena 视图只有 dtype/ndim 进类型，标量侧无 int/float 分叉），selftest 全覆盖兜底。</p>
+<h3>14.2 常驻化身与 pinned 回读</h3>
+<p>直连之后，发射路径上最贵的剩余工序是给每个 cupy 参数解析 CAI——而对常驻缓冲（FFT 工作区、g_pos 这些整场不换的对象），这份解析每次都得出同样的结果。<code>register_twin()</code> 把它们一次性包成 numba device array，<code>launch()</code> 里按 <code>id</code> 换成化身，走 is_device_memory 的快分支，CAI 解析归零；同一味药也治主机回读：<code>read_pos()</code> 用预分配的 pinned 缓冲做异步拷贝，免掉每次回读的临时分配。</p>
+<pre class="code"><code># 节选自 pi-numba/common.py —— 常驻缓冲的一次性化身 + pinned 回读
+_nb_twins = {}             # id(常驻 cupy 数组) -&gt; 一次性 numba device array
+
+def register_twin(arr):
+    """只对模块级常驻数组调用（id 因对象常驻而稳定）；化身与原数组同指针同 dtype。"""
+    from numba import cuda as _cuda
+    _nb_twins[id(arr)] = _cuda.as_cuda_array(arr, sync=False)
+
+def read_pos():                          # pinned 缓冲：免每次回读的 numpy 分配
+    cp.cuda.runtime.memcpyAsync(_pos_pin.ptr, g_pos.data.ptr, 8,
+                                cp.cuda.runtime.memcpyDeviceToHost, 0)
+    cp.cuda.runtime.streamSynchronize(0)
+    return int(_pos_np[0])</code></pre>
+
+<h3>14.3 一个负结果与 JIT 预热：测量胜于推理</h3>
+<p>common.py 文件头还有两行必须<b>先于 <code>import numba</code> 注入</b>的环境变量：<code>NUMBA_CUDA_ARRAY_INTERFACE_SYNC=0</code> 与 <code>NUMBA_CUDA_LOW_OCCUPANCY_WARNINGS=0</code>（setdefault 写法，外部显式置 1 可回退）。前者曾被寄予厚望——全程单默认流、同流天然有序，per-launch 的 CAI 流同步纯属冗余，理论上每次发射都能省一笔——A/B 实测增益 <b>≈0</b>。负结果照样进正文：它证明真正的肥肉在 dispatcher 本身而不在这次同步，也把「测量胜于推理」又演了一遍——假说负责排优先级，秒表负责定生死。</p>
+<p>最后一笔税只交一次：同进程第一遍运行含全部 kernel 的 JIT 编译，墙钟 177.5 秒；其后热跑只要 ~5.630 秒。生产姿势因此固定为「1 次预热 + N 次正式」，本文所有计时都取热跑。</p>
+<figure><svg viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12" role="img"><text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">一次 1 亿位运行的 kernel 发射总数</text><line x1="70" y1="40" x2="70" y2="205" stroke="#999"/><line x1="70" y1="205" x2="800" y2="205" stroke="#999"/><line x1="66" y1="205" x2="70" y2="205" stroke="#999"/><text x="62" y="209" font-size="11" text-anchor="end" fill="#555">0k</text><line x1="66" y1="150" x2="70" y2="150" stroke="#999"/><text x="62" y="154" font-size="11" text-anchor="end" fill="#555">10k</text><line x1="66" y1="95" x2="70" y2="95" stroke="#999"/><text x="62" y="99" font-size="11" text-anchor="end" fill="#555">20k</text><line x1="66" y1="40" x2="70" y2="40" stroke="#999"/><text x="62" y="44" font-size="11" text-anchor="end" fill="#555">30k</text><rect x="170" y="62" width="90" height="143" rx="3" fill="#2c5f8f"><title>基线：26,011 次</title></rect><text x="215" y="57" font-size="11" text-anchor="middle" fill="#333">26,011</text><text x="215" y="223" font-size="12" text-anchor="middle" fill="#555">未开算法优化</text><rect x="390" y="59" width="90" height="146" rx="3" fill="#2c5f8f"><title>开 middle product：26,563 次</title></rect><text x="435" y="54" font-size="11" text-anchor="middle" fill="#333">26,563</text><text x="435" y="223" font-size="12" text-anchor="middle" fill="#555">开 middle product（第 16 节）</text><rect x="610" y="60" width="90" height="145" rx="3" fill="#2c5f8f"><title>23,251 次</title></rect><text x="655" y="55" font-size="11" text-anchor="middle" fill="#333">23,251</text><text x="655" y="223" font-size="12" text-anchor="middle" fill="#555">全部优化</text><text x="430" y="252" font-size="11.5" text-anchor="middle" fill="#5b6b7b">三根柱几乎持平——Python 侧的优化不动发射数，动的是单价：dispatcher 每发射 ≈40 µs 的手续，直连 + 化身之后基本归零</text></svg><figcaption>图 11：kernel 发射数在三个阶段几乎持平（1e8 全程）。发射税的削减不靠减少次数，靠压低每次的单价。</figcaption></figure>
+<div class="callout"><b>格言三：解释器的世界里，每一次跨界（Python↔驱动）都要计价——把跨界摊薄，而不是幻想消灭跨界。</b>specialize 缓存一次、化身注册一次、pinned 缓冲留一块，都是同一个动作：把 O(发射数) 的每次手续，折旧成 O(1) 的一次性投资。发射数几乎没动（图 11），动的是单价。</div>
+<h2 id="c15">15. 深度融合：设备端库的独门优势</h2>
+<p>至此，每次大乘法的中段仍是一条十几个 kernel 的链：<b>纯搬运 kernel（转置/置换/装载/取整）与计算 kernel（FFT/逐点乘）交替出现</b>，每个都是一遍全量显存读写——2<sup>28</sup> 点时一遍就是 4GB。现在兑现第 3 节的伏笔：既然 FFT 是你 kernel 里的一行，它前后的装载/写回相位就是你的代码——<b>把相邻的搬运 kernel 折进计算 kernel 的装载/写回相位</b>，发射和整遍带宽一起省。这样的动词在主机调用模型里根本不存在（那里连「装载时顺手转个类型」都要走回调的窄门），而在设备端模型里只是改自己 kernel 里的一个循环。判断能不能融只有一条法则：<b>融合后一个线程块的工作集必须装进共享内存</b>。逐一排查：</p>
+<table><tr><th>融合点</th><th>块工作集</th><th>判定</th></tr><tr><td><b>F2</b>：外层 twiddle 转置 + R 点 FFT（正逆两向）</td><td class="num">R×32 ≤ 64×32 复数 ≈ 34KB</td><td class="pass">可行</td></tr><tr><td><b>F3</b>：逆变换尾部两连置换 + 取整 + 误差归约</td><td class="num">32×32 tile ≈ 16KB</td><td class="pass">可行</td></tr><tr><td><b>F1</b>：入口装载 + 首个置换</td><td class="num">32×32 tile ≈ 16KB</td><td class="pass">可行</td></tr><tr><td>kernel B 两侧的行内转置</td><td class="num">32 行 × 2048 点 ≈ 1MB</td><td><b>不可行</b></td></tr></table>
+<p><b>F2</b> 是最大的一块。融合前：twiddle 转置 kernel 写出 4GB，R 点 FFT kernel 再读回 4GB；融合后一个 kernel 里走完——twiddle 在「反正也要读」的装载相位上白送，块内转置经共享内存 slab 完成（[R][33] 布局，多出的一列专治 bank 冲突），FFT 在寄存器上就地执行，结果直接按 σ 序落显存：</p>
+<figure><svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ahf" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">F2 融合前后：省掉一次 8GB 的显存往返（2^28 点时）</text>
+<text x="20" y="52" fill="#5b6b7b">融合前（两个 kernel）：</text>
+<rect x="30" y="64" width="230" height="46" rx="6" fill="#eef3fa" stroke="#666"/>
+<text x="145" y="83" text-anchor="middle" font-family="monospace">k_transpose2_twr</text>
+<text x="145" y="100" text-anchor="middle" fill="#5b6b7b" font-size="11">twiddle + 转置（纯搬运）</text>
+<rect x="330" y="64" width="200" height="46" rx="6" fill="#faf0e6" stroke="#c07a3a" stroke-width="2"/>
+<text x="430" y="83" text-anchor="middle">显存 4GB 写 + 4GB 读</text>
+<text x="430" y="100" text-anchor="middle" fill="#c07a3a" font-size="11">≈ 每次大乘法 4 ms</text>
+<rect x="600" y="64" width="230" height="46" rx="6" fill="#eaf6ec" stroke="#666"/>
+<text x="715" y="83" text-anchor="middle" font-family="monospace">k_stageR</text>
+<text x="715" y="100" text-anchor="middle" fill="#5b6b7b" font-size="11">R 点 FFT（计算）</text>
+<line x1="262" y1="87" x2="328" y2="87" stroke="#666" marker-end="url(#ahf)"/>
+<line x1="532" y1="87" x2="598" y2="87" stroke="#666" marker-end="url(#ahf)"/>
+<text x="20" y="160" fill="#5b6b7b">融合后（一个 kernel，k_stageR_fused）：</text>
+<rect x="30" y="172" width="800" height="100" rx="8" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="2"/>
+<rect x="52" y="190" width="228" height="62" rx="6" fill="#fff" stroke="#666"/>
+<text x="166" y="212" text-anchor="middle">装载：读显存行</text>
+<text x="166" y="230" text-anchor="middle" fill="#5b6b7b" font-size="11">顺手乘 twiddle</text>
+<text x="166" y="246" text-anchor="middle" fill="#5b6b7b" font-size="11">（本来也要读，搬运白送）</text>
+<rect x="316" y="190" width="228" height="62" rx="6" fill="#eef4ff" stroke="#666"/>
+<text x="430" y="212" text-anchor="middle">共享内存 slab [R][33]</text>
+<text x="430" y="230" text-anchor="middle" fill="#5b6b7b" font-size="11">块内转置（+1 列防 bank 冲突）</text>
+<text x="430" y="246" text-anchor="middle" fill="#5b6b7b" font-size="11">32 列 × R 行 ≈ 34KB</text>
+<rect x="580" y="190" width="228" height="62" rx="6" fill="#fdeeee" stroke="#666"/>
+<text x="694" y="212" text-anchor="middle" font-family="monospace">fft.execute</text>
+<text x="694" y="230" text-anchor="middle" fill="#5b6b7b" font-size="11">寄存器上的 R 点 FFT</text>
+<text x="694" y="246" text-anchor="middle" fill="#5b6b7b" font-size="11">写回按 σ 序直接落显存</text>
+<line x1="282" y1="221" x2="314" y2="221" stroke="#666" marker-end="url(#ahf)"/>
+<line x1="546" y1="221" x2="578" y2="221" stroke="#666" marker-end="url(#ahf)"/>
+<text x="430" y="292" text-anchor="middle" fill="#1c7c3c">中间结果从不落显存 —— 这只有当 FFT 是「你 kernel 里的一行」时才写得出来</text>
+</svg><figcaption>图 12：F2 融合前后。中间那趟 8GB 的显存往返（写 4GB + 读 4GB）整个消失。</figcaption></figure>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— F2 融合（make_stageR_fused，正向分支）：twiddle 转置 + R 点 FFT 一个 kernel 完成
+    @cuda.jit
+    def k_stageR_fused(inp, out, M, N, Qin):
+        ...
+        if not IS_INV:
+            idx = tid
+            while idx &lt; Rv * 32:
+                b = idx >> 5
+                sc = idx &amp; 31
+                v = inp[b * M + s0 + sc]
+                sn, cs = libdevice.sincospi(-(b * ki_of_s(s0 + sc, Qin)) * invN2)
+                slab[idx + (idx >> 5)] = v * complex(cs, sn)   # b=0 → 角度 0，精确恒等
+                idx += nthreads
+            cuda.syncthreads()
+            for i in range(ept):
+                e = cuda.threadIdx.x + i * stride
+                if e &lt; Rv:
+                    rd[i] = slab[e * 33 + sy]
+            cuda.syncthreads()
+            fft.execute(rd, slab)
+            ...
+                    out[(s0 + sy) * Rv + e] = rd[i]</code></pre>
+<p><b>F3</b> 处理逆变换尾部：那里原本是两个背靠背的纯转置 kernel 加一个取整 kernel（三遍全量读写）。两个置换的复合仍是一个置换——推一下下标代数：in[b·M + j·2048 + i] 应落到 raw[T·i + t]（T = R·Q，t = R·j + b），恰好读侧写侧都能做到合并访问；取整与 0.25 红线的误差归约顺势成为写出相位：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— F3 融合（k_perm_rint）：尾部置换 + 取整 + 残差归约一个 kernel 完成
+@cuda.jit
+def k_perm_rint(inp, M, R, T, m, raw, err):
+    tile = cuda.shared.array((32, 33), dtype=complex128)
+    ...
+    while dt &lt; 32:
+        t = t0 + dt
+        if t &lt; T:
+            b = t % R
+            j = t // R
+            tile[dt][cuda.threadIdx.x] = inp[b * M + j * FFT_P + i0 + cuda.threadIdx.x]
+    ...
+        n = T * (i0 + dy) + t0 + cuda.threadIdx.x
+        if t0 + cuda.threadIdx.x &lt; T and n &lt; m:
+            v = tile[cuda.threadIdx.x][dy]
+            r = libdevice.llrint(v.real)
+            raw[n] = r
+            e = abs(v.real - r)
+            ei = abs(v.imag)
+    ...
+    if tid == 0:
+        cuda.atomic.max(err, 0, libdevice.double_as_longlong(sh[0]))</code></pre>
+<p><b>F1</b> 是 F3 的镜像（入口装载 + 首个置换复合），不再展开。三批改造各自独立落地、各自过完整验证阶梯（第 19 节）——恒等式测试在最小的三级规模 2<sup>23</sup> 上秒级暴露任何置换/twiddle 笔误，这是「先小后大」的验证纪律第无数次领工资。三级流水线的 kernel 数：正变换 7 → 5，逆变换 8 → 5。成绩：</p>
+<p>深度融合在本实现里是移植时就带进来的底座，收益直接写在每次大乘法的静态 kernel 账本上：三级路径的非平方乘法全程 15 个 kernel、平方 13 个、middle product 路径 18 个——一次一亿位运行合计 23,251 次发射（第 14 节图 11）。若没有这层融合，每一次大乘法都要再多几遍全量显存往返，而 2<sup>28</sup> 点时一遍就是 4GB。</p>
+<div class="callout"><b>全文第二重要的一句话：库的 kernel 边界是墙时，你只能优化墙与墙之间；库的 kernel 边界是你画的线时，整条流水线都是优化对象。</b>这套流水线的性能工程里，原子归约、省字节这类改造在任何执行模型下都能做，而这最后一段深度融合——以及第 12 节的装载/twiddle 融合——只属于设备端路线：<code>fft.execute</code> 前后的字节归你管，这条线才画得动。同时诚实记录边界的另一侧：kernel B 两侧的转置融不动，剩余时间里它们仍占一份——共享内存的大小，就是这条独门优势的射程。</div>
+<p>收束一下这条设备端工作流积累的能力清单：<b>① 融合控制权</b>——本节整节，任何主机端库给不了；<b>② 零主机开销</b>——没有 plan、没有句柄、没有库状态机，第 9 节那张每轮耗时平滑下行的表就是证词；<b>③ 单 kernel 组合能力</b>——kernel B 里装载、twiddle、2048 点 FFT 与写回在同一块共享内存上接力（第 10 节）；<b>④ 编译期定制</b>——每种规格单独编译的专用 kernel，没有运行期分支税。</p>
+<p>接下来的三节会证明：同一套方法论——先 profile、恒等式安全网、严格的 A/B 纪律（第 19 节）——还能把性能继续提升：先用精确 middle product 砍掉四分之三座 FFT（第 16 节，一刀 −26.1%），再让进位流水线顺手化、融合化、稀疏化（第 18 节），把频域中段融成一个 kernel（第 17 节）；连同第 14 节的发射税治理与共享内存 padding 这样的零碎。</p>
+<h2 id="c16">16. 只算需要的那一段：精确 middle product</h2>
+<p>全场最深的一刀，直接砍向最大的一块：牛顿迭代的大乘法本身。线索不在 kernel 里，而在<b>调用者</b>手上。回看第 7、9 节：牛顿步里的不少乘法，算完立刻右移——</p>
+<pre class="code"><code>rsqrt_y_rr:      y · rr &gt;&gt; 2hm     // 残差修正量：只要乘积的高位
+rsqrt_K_y:       K · y  &gt;&gt; h       // 平方根回代
+recip_w_e_ramp:  w · e  &gt;&gt; gm      // 倒数爬升步
+recip_w_e_final: w · e  &gt;&gt; g       // 倒数收尾</code></pre>
+<p>完整乘积有 mfull = nx+ny−1 个 limb，右移丢掉低位 shift 个——我们付了整座 2<sup>28</sup> 点 FFT 的钱，买回来的只有高位窗口 wanted = mfull − shift 个 limb，<b>不到全款的四分之一</b>。第 12 节省的是「怎么算」的字节，这一节省的是「算什么」：把每个这样的调用点打上语义标签，统一走一个可回退的接口——</p>
+<pre class="code"><code># 节选自 pi-numba/newton.py —— semantic_mul_shr：语义标签，调用者声明「我只要乘积的高位」
+def semantic_mul_shr(a, b, shift, semantic):
+    # 调用者声明「只要高位」，middle product 区间不坍缩时自动回退完整乘法
+    return F.big_mul_high_proto(a, b, shift, semantic)
+    ...
+            delta = big_half(semantic_mul_shr(y, rr, 2 * hm, "rsqrt_y_rr"))
+    ...
+    s = strip(semantic_mul_shr(K, y, h, "rsqrt_K_y"))
+    ...
+            delta = strip(semantic_mul_shr(w, e, gm, "recip_w_e_ramp"))
+    ...
+        delta = strip(semantic_mul_shr(w, e, g, "recip_w_e_final"))</code></pre>
+<p>只算高位窗口的技巧是一次<b>反转</b>：把两个操作数的高位前缀各自倒序，原乘积的高位窗口恰好变成反转乘积的<b>低位窗口</b>——而低位窗口只依赖两个短前缀的卷积，FFT 规模从 Nfull 掉到 Nrev。一亿位主力档位上这一跌就是<b>三级</b>（2<sup>28</sup> → 2<sup>25</sup>，FFT 便宜约 8 倍）；跌不下去（Nrev ≥ Nfull）就直接回退完整乘法，白忙一场不如不忙。</p>
+<figure><svg viewBox="0 0 860 290" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah18" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">middle product：把「高位窗口」反转成短卷积的「低位窗口」</text>
+<text x="20" y="52" fill="#5b6b7b">原路径：完整乘积 mfull 个 limb（FFT 规模 Nfull = 2²⁸）</text>
+<rect x="30" y="62" width="560" height="34" rx="4" fill="#eef3fa" stroke="#666"/>
+<rect x="590" y="62" width="240" height="34" rx="4" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="1.5"/>
+<text x="310" y="83" text-anchor="middle" fill="#5b6b7b">低位 shift 个 limb —— 算完即被 &gt;&gt; 丢弃</text>
+<text x="710" y="83" text-anchor="middle">高位窗口 wanted</text>
+<line x1="430" y1="110" x2="430" y2="146" stroke="#666" marker-end="url(#ah18)"/>
+<text x="446" y="132" fill="#2c5f8f">两操作数高位前缀各自反转（k_reverse_high）</text>
+<text x="20" y="172" fill="#5b6b7b">新路径：短前缀卷积 mrev 个 limb（FFT 规模 Nrev = 2²⁵，跌三级）</text>
+<rect x="30" y="182" width="240" height="34" rx="4" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="1.5"/>
+<rect x="270" y="182" width="56" height="34" rx="4" fill="#fdeeee" stroke="#c07a3a" stroke-width="1.5"/>
+<rect x="326" y="182" width="130" height="34" rx="4" fill="#fff" stroke="#999" stroke-dasharray="4 3"/>
+<text x="150" y="203" text-anchor="middle">wanted（反转后在低位）</text>
+<text x="298" y="203" text-anchor="middle" font-size="11">guard</text>
+<text x="391" y="203" text-anchor="middle" fill="#5b6b7b" font-size="11">其余不必算</text>
+<text x="30" y="248" fill="#333">guard 之外的截断进位未知，但有界：入口进位 ∈ [0, U]，U 由卷积系数上界推出。</text>
+<text x="30" y="268" fill="#333">把 0 与 U <tspan fill="#2c5f8f">双端同时穿过 guard 窗口</tspan>：两端收敛到同一进位 ⇒ 结果逐 limb 精确；否则回退完整乘法。</text>
+</svg><figcaption>图 13：middle product 的反转技巧与 guard 区间。绿色是真正要算的窗口；guard 是为「未知入口进位」买的保险，保额（U 的位数）算出来，不是拍出来。</figcaption></figure>
+<p>剩下的问题是<b>精确性</b>——被截掉的低位仍可能通过长进位链进犯高位窗口，第 5 节的 999…9 暗礁换了个马甲回来了。这里的处理是全文对「快与准」关系最好的一次示范：<b>不是凭经验多留几个 guard limb，而是把不确定性变成区间，再验证区间坍缩。</b>截断处的未知入口进位有严格上界 U（由卷积系数上界 min(nx,ny)·999² 推出，guard 取 2 + log<sub>B</sub>U，实测 5～6 个 limb）；把区间两端 [0, U] 同时穿过 guard 窗口，只有两端在窗口出口收敛到同一个进位值，截断结果才被采用：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— big_mul_high_proto：截断进位的严格区间 [0,U] 双端穿越 guard 窗口，不坍缩就回退
+    cmax = min(nx, ny) * 999 * 999
+    U = (cmax + (LIMB_B - 2)) // (LIMB_B - 1)
+    guard = 2
+    t = U
+    while t:
+        guard += 1
+        t //= LIMB_B
+    ...
+    hg = draw[wanted:wanted + guard].get()          # guard 窗口（主机侧区间穿越）
+    qlo, qhi = 0, U
+    for i in range(guard):
+        c = int(hg[guard - 1 - i])
+        qlo = (c + qlo) // LIMB_B
+        qhi = (c + qhi) // LIMB_B
+    if qlo != qhi:
+        _mlog(f"{semantic},nx={nx},ny={ny},shift={shift},guard={guard},used=0,reason=carry_interval,lo={qlo},hi={qhi}")
+        g_cnt.add("middle_fallback")
+        return strip(big_shr(big_mul(x, y), shift))</code></pre>
+<p>所以这是<b>精确</b> middle product，不是近似 high product——每个 limb 与完整乘法逐位一致，0.25 红线在缩小后的 FFT 上照常执勤。一亿位全程：354 个窗口用上缩小 FFT，116 个调用因形状不合适、规模太小或区间不唯一而安全回退；全 999 与超长进位链的对抗输入（第 19 节的 middlebench）正是靠回退拿到逐 limb 正确。整条阶梯上最大的一笔收益，来自一行都没改的 FFT 本体。</p>
+<div class="callout"><b>格言四：最快的乘法是不算的乘法。</b>第 12 节在「怎么算」里省字节，这一节在「算什么」里省整座 FFT——先问调用者到底要哪一段，再谈把那一段算多快。而「少算」的前提是把不确定性关进可验证的区间里：<b>快由窗口负责，准由区间负责，不确定就回退。</b></div>
+<h2 id="c17">17. 融合进行到底：频域三合一</h2>
+<p>第二刀回到第 15 节的主战场。深度融合把「搬运」折进了「计算」的装载/写回相位，但三级分解（N &gt; 2<sup>22</sup>）的<b>频域中段</b>还留着一条三连发射：末级 R 点正 FFT（<code>k_stageR_fused</code> 正向）→ 频域平方或 2-for-1 解包乘（<code>k_pw_sqr</code> / <code>k_pw_2for1</code>）→ 首级 R 点逆 FFT。三个 kernel，每个都对同一批数据做一遍全量显存读写——2<sup>28</sup> 点时一遍就是 4GB。再量一次工作集：R ≤ 64，一个 CTA 负责 32 列，整块 R×32 slab 不过 64×32 个复数 ≈ 32KB（packed 路径两块也才 66KB）——<b>第 15 节的融合判据亮绿灯</b>。这次融的不再是「搬运＋计算」，而是「计算＋计算＋计算」：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— make_rconv_square：装载乘 twiddle、正 FFT、频域平方、逆 FFT、写回，一个 kernel 走完
+    @cuda.jit
+    def k_rconv_square(data, M, N, Qin):
+        slab = cuda.shared.array(0, dtype=vt)          # [Rv][33]，与 FFT 工作区复用
+        rd = cuda.local.array(shape=(st,), dtype=vt)
+    ...
+        while idx &lt; Rv * 32:
+            b = idx >> 5
+            sc = idx &amp; 31
+            v = data[b * M + s0 + sc]
+            sn, cs = libdevice.sincospi(-(b * ki_of_s(s0 + sc, Qin)) * invN2)
+            slab[idx + (idx >> 5)] = v * complex(cs, sn)
+            idx += nthreads
+    ...
+        fwd.execute(rd, slab)
+    ...
+                z = rd[i]
+                rd[i] = (z * z) * invN     # vt 向量型支持乘法（复数语义），不支持 .real/.imag
+    ...
+        inv.execute(rd, slab)
+    ...
+            data[b * M + s0 + sc] = v * complex(cs, sn)</code></pre>
+<p>平方路径顺理成章，<b>2-for-1 乘法路径才是硬骨头</b>：频域解包要同时访问镜像 bin（第 12 节的 A/B 共轭拆解），而镜像 bin 落在<b>另一个</b> R×32 slab 里。解法是把配对做成数据：主机侧预生成一张<b>唯一 mirror tile-pair 描述表</b>（2<sup>22</sup> 内层规模下共 65,535 对），普通 CTA 按 <code>blockIdx.x</code> 领走一对描述子、同时装载两块镜像 slab 各自变换后交叉相乘；自共轭 bin 与不对齐的首块（s=0 邻域、Q/2 列）归一个 <code>SPECIAL</code> 分支的专用 CTA 单独处理——分支税只落在 1 个块上，其余 65,535 个块走无分支快路径。两块 slab 加变换工作区超过了 48KB 的默认共享内存上限，发射端用 opt-in 属性申请：</p>
+<pre class="code"><code># 节选自 pi-numba/fft.py —— dispatch_rconv_packed：动态共享内存超过 48KB 需在 driver 层显式解锁
+def dispatch_rconv_packed(R, data, M, N, Qin):
+    # 恒走 prime+直连（dispatcher 兜底路径会另编译一份未解锁 >48KB 属性的
+    # cufunc，R≥32 时发射直接失败）。
+    k, fwd, inv = _get(("rconvP", R), lambda: make_rconv_packed(R))
+    smem = ((max(fwd.shared_memory_size, inv.shared_memory_size) + 15) &amp; ~15) \
+        + 2 * R * 33 * 16
+    args = tuple(C._nb_twins.get(id(a), a)
+                 for a in (data, int64(M), float(N), int64(Qin), g_rconv_pairs, 0))
+    krn = C.prime(k, *args)
+    if R not in _rconv_attr_done:
+        from numba.cuda.cudadrv.driver import driver as _drv
+        from cuda.bindings import driver as _binding
+        cufunc = krn._codelibrary.get_cufunc()
+        _drv.cuKernelSetAttribute(
+            _binding.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem, cufunc.handle, cufunc.device.id)
+        _rconv_attr_done.add(R)
+    npairs = g_rconv_pairs.size // 2
+    ...
+    krn.launch(args, (int(npairs), 1, 1), bd, C.core_stream0(), smem)
+    krn.launch(args[:5] + (1,), (1, 1, 1), bd, C.core_stream0(), smem)</code></pre>
+
+<p>两刀与 middle product 几乎完全正交：一刀砍 FFT 的<b>座数</b>（算什么），一刀提速每座 FFT 的<b>中段</b>（怎么算），互不侵占对方的收益。这是第 15 节那条法则的第二次领工资——判据没变过：<b>工作集装得进共享内存，就融。</b></p>
+<h2 id="c18">18. 进位流水线：顺手、融合与稀疏</h2>
+<p>乘法便宜下来之后，profiler 榜单上浮出水面的是进位链——第 13 节落地的那套「段内精确 + 前瞻扫描」kernel。字节都合并了，剩下的问题只有一个：<b>全量扫描的遍数</b>。这一章两步走：先让别的 kernel「顺手」把扫描的活干了，再让扫描本身消失。</p>
+<h3>18.1 顺手做完的 strip</h3>
+<p>第一步来自一个简单的观察：<code>strip()</code>（找最高非零 limb）此前是一个独立的全数组扫描 kernel，可进位应用 k_scan_apply <b>本来就要看到每一个最终 digit</b>，何必再扫一遍？让它顺手记下每个 chunk 的最高非零位置，之后只需归约几千个 chunk 极值，而不是三千多万个 limb——独立的 strip 扫描从此整个出局。</p>
+<div class="callout"><b>格言五：已经把数据拿在手里的 kernel，应该顺手做完所有需要这份数据的事。</b>访存主导的世界里，第二次全数组扫描是对带宽的犯罪——「顺手」（fusion of concerns）和第 15 节的「融合」（fusion of kernels）是同一个道理的两种写法。</div>
+<h3>18.2 融合与稀疏</h3>
+<p>顺手的 strip 落地之后再看 profile，乘法归一化（FFT 的 int64 原始系数 → 合法 base-1000 digit）的路径还是一条五连发射，<b>每个 kernel 都对三千多万 limb 做一遍全量读写</b>：k_carry_seg → k_carry_fix → k_scan_agg → k_scan_chunks → k_scan_apply。访存形态的功课都做完了（第 13 节），下一层收益只能来自「少跑几遍」。接下来的四步改造，是「顺手原则」（格言五）的毕业设计：</p>
+<p><b>第一步：段间修正折进 k_carry_seg。</b>原本阶段②（前段出位加进本段）是独立 kernel，重新把 digit 读一遍。现在 CTA 内部经共享内存直接传递相邻段的出位；CTA 边界没有跨块同步——让每块的 0 号线程从原始输入<b>重算</b>前一段的出位，几十次额外读取换掉一整个全局 kernel：</p>
+<pre class="code"><code># 节选自 pi-numba/common.py —— fused 段内进位：段间修正折进来，(g,p)、Tgp、SegHi 全部顺手产出
+@cuda.jit
+def k_carry_seg_fused(inp, n, digits, res01, sign, Gc, Pc, Tgp, SegHi):
+    ...
+        if d == (LIMB_B - 1 if sign > 0 else 0):
+            prop_mask |= 1 &lt;&lt; k
+    ...
+    if cuda.threadIdx.x == 0 and seg > 0:
+        ...
+            vb = inp[p1 + k] + qbase
+            qbase = floordiv_b(vb)
+    ...
+    if cuda.threadIdx.x != 0:
+        prev_q = shq[cuda.threadIdx.x - 1]
+    ...
+    if seg &lt; nseg:
+        Tgp[seg] = g | (p &lt;&lt; 1)
+        ...
+        SegHi[seg] = uint8(hi)
+    ...
+        Gc[cuda.blockIdx.x] = G
+        Pc[cuda.blockIdx.x] = P</code></pre>
+<p>k_carry_fix 从乘法归一化的路径上整个消失——这一步单独看落在噪声带里，但它是后两步的地基。</p>
+<p><b>第二步：G/P 也顺手算。</b>前瞻扫描的 (g, p) 半群（第 13 节：g=必然产生进位，p=进位会穿过）原本由 k_scan_agg 重新读一遍 digit 来算——可 digit 此刻就躺在 k_carry_seg 的共享内存里。顺手：段内归一化时用位掩码记录「digit 是否等于 999/0」，段尾算出每段 g/p，0 号线程再聚合出整个 chunk 的 G/P。乘法路径上的 k_scan_agg 全部免掉，只剩加减法在用。<b>第三步：算过的不再算第二遍。</b>每段 g/p 只有两个 bit，打包成一字节存进 Tgp 表（全程峰值多花约 1 MiB），下游 apply 直接查表，免去每线程再遍历 32 个 limb。</p>
+<p><b>第四步才是收网：稀疏 apply。</b>关键观察：乘法系数经过段内精确归一化后，<b>绝大多数段已经是合法 digit、入口进位为 0</b>——而通用 k_scan_apply 不管三七二十一，把每个段完整读一遍再完整写一遍。稀疏版只处理进位实际触及的前缀：</p>
+<pre class="code"><code># 节选自 pi-numba/common.py —— 稀疏 apply：只写进位触及的前缀，SegHi 不变量保住 strip 精确性
+@cuda.jit
+def k_scan_apply_sparse(s, n, sign, res, Cin, Tgp, SegHi, Hc):
+    ...
+    i0 = seg * CSEG
+    delta = int64(thr_in[cuda.threadIdx.x]) if sign > 0 else -int64(thr_in[cuda.threadIdx.x])
+    if seg > 0 and i0 &lt; n:
+        delta += int64(res[seg - 1])
+    touched = 0
+    changed_hi = 0
+    k = 0
+    while k &lt; CSEG and i0 + k &lt; n and delta != 0:
+        v = int64(s[i0 + k]) + delta
+        delta = floordiv_b(v)
+        d = int32(v - delta * LIMB_B)
+        s[i0 + k] = d
+        touched = k + 1
+        if d != 0:
+            changed_hi = k + 1
+        k += 1
+    old_hi = int(SegHi[seg]) if seg &lt; nseg else 0
+    seg_hi = old_hi if old_hi > touched else changed_hi</code></pre>
+<p>注意最后两行：strip 的精确性（18.1 节刚并进扫描）差点被稀疏化毁掉——不读整段就不知道最高非零位在哪。保险单是 <code>SegHi</code>：k_carry_seg 归一化时顺手用位掩码记下每段最高非零位置；稀疏修改后，若旧最高位落在未触及的后缀里它仍然精确，否则由被改前缀的 <code>changed_hi</code> 给出。<b>每一次「跳过」都有不变量作保。</b></p>
+<figure><svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+<defs><marker id="ah20" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#666"/></marker></defs>
+<text x="430" y="20" font-size="14" text-anchor="middle" fill="#222">乘法归一化路径：五连全量扫描 → 融合 + 稀疏</text>
+<text x="20" y="48" fill="#5b6b7b">融合前（每个 kernel 一遍全量显存读写）：</text>
+<rect x="30" y="60" width="140" height="48" rx="6" fill="#eef4ff" stroke="#666"/><text x="100" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_carry_seg</text><text x="100" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">段内精确进位</text>
+<rect x="196" y="60" width="140" height="48" rx="6" fill="#eef4ff" stroke="#666"/><text x="266" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_carry_fix</text><text x="266" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">段间修正（再读一遍）</text>
+<rect x="362" y="60" width="140" height="48" rx="6" fill="#eef4ff" stroke="#666"/><text x="432" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_scan_agg</text><text x="432" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">G/P（又读一遍）</text>
+<rect x="528" y="60" width="140" height="48" rx="6" fill="#fff" stroke="#666"/><text x="598" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_scan_chunks</text><text x="598" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">chunk 间串链（小）</text>
+<rect x="694" y="60" width="140" height="48" rx="6" fill="#eef4ff" stroke="#666"/><text x="764" y="80" text-anchor="middle" font-family="monospace" font-size="11">k_scan_apply</text><text x="764" y="97" text-anchor="middle" fill="#5b6b7b" font-size="11">全量读 + 全量写</text>
+<line x1="172" y1="84" x2="194" y2="84" stroke="#666" marker-end="url(#ah20)"/><line x1="338" y1="84" x2="360" y2="84" stroke="#666" marker-end="url(#ah20)"/><line x1="504" y1="84" x2="526" y2="84" stroke="#666" marker-end="url(#ah20)"/><line x1="670" y1="84" x2="692" y2="84" stroke="#666" marker-end="url(#ah20)"/>
+<text x="20" y="160" fill="#5b6b7b">融合 + 稀疏后（一个胖 kernel 生产全部元数据，apply 稀疏化）：</text>
+<rect x="30" y="174" width="300" height="96" rx="8" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="2"/>
+<text x="180" y="194" text-anchor="middle" font-family="monospace" font-size="11.5">fused k_carry_seg</text>
+<text x="180" y="212" text-anchor="middle" font-size="11">digit 归一化 ＋ 段间修正（原 fix）</text>
+<text x="180" y="229" text-anchor="middle" font-size="11">＋ 段/chunk G·P（原 agg）＋ Tgp 打包</text>
+<text x="180" y="246" text-anchor="middle" font-size="11">＋ SegHi 段内最高位（strip 的保险单）</text>
+<text x="180" y="263" text-anchor="middle" fill="#5b6b7b" font-size="11">digit 只在共享内存里过一遍手</text>
+<rect x="366" y="198" width="140" height="48" rx="6" fill="#fff" stroke="#666"/><text x="436" y="218" text-anchor="middle" font-family="monospace" font-size="11">k_scan_chunks</text><text x="436" y="235" text-anchor="middle" fill="#5b6b7b" font-size="11">chunk 间串链（小）</text>
+<rect x="542" y="186" width="180" height="72" rx="6" fill="#eaf6ec" stroke="#1c7c3c" stroke-width="2"/>
+<text x="632" y="207" text-anchor="middle" font-family="monospace" font-size="11">k_scan_apply_sparse</text>
+<text x="632" y="224" text-anchor="middle" font-size="11">只写进位摸过的前缀</text>
+<text x="632" y="241" text-anchor="middle" fill="#5b6b7b" font-size="11">delta=0 的段零读零写</text>
+<rect x="742" y="198" width="100" height="48" rx="6" fill="#fff" stroke="#666"/><text x="792" y="218" text-anchor="middle" font-family="monospace" font-size="10">k_reduce_</text><text x="792" y="230" text-anchor="middle" font-family="monospace" font-size="10">chunk_hi</text><text x="792" y="243" text-anchor="middle" fill="#5b6b7b" font-size="10">strip 收尾</text>
+<line x1="332" y1="222" x2="364" y2="222" stroke="#666" marker-end="url(#ah20)"/><line x1="508" y1="222" x2="540" y2="222" stroke="#666" marker-end="url(#ah20)"/><line x1="724" y1="222" x2="740" y2="222" stroke="#666" marker-end="url(#ah20)"/>
+<text x="430" y="304" text-anchor="middle" fill="#1c7c3c" font-size="11.5">加减法输入不满足「几乎已归一化」的值域假设，仍走通用 agg/apply —— 假设不出乘法归一化的门</text>
+</svg><figcaption>图 14：进位流水线的融合与稀疏化。左侧胖 kernel 在 digit 驻留共享内存的那一遍手里，顺手生产出下游需要的全部元数据。</figcaption></figure>
+<p>实测（1 亿位全程）：乘法归一化从 6 个 kernel（独立 strip + 五连全量扫描）压到 4 个；与频域三合一合计，全程 kernel 发射数从 26,563 降到 23,251。</p>
+
+<p>「不扫描」赢过任何「更快的扫描」——稀疏 apply 里 delta=0 的段一个字节都不碰。这份「顺手 + 融合 + 稀疏」的组合固化为交付版的进位流水线，也是阶梯上这一档收益的全部来源。</p>
+<div class="callout"><b>格言六：优化全量扫描的尽头，是让扫描消失。</b>局部归一化之后，进位通常只影响很短的前缀——为常见情形建快路径，为罕见情形留通用路径，并让每一次「跳过」都有不变量（SegHi、值域假设的边界）作保。</div>
+<h2 id="c19">19. 正确性验证</h2>
+<p>手搭 FFT 最怕「悄悄算错」，而阶梯后段的改造——尤其 middle product 和稀疏进位这种「少算」型优化——把风险又抬高了一档。</p>
+<p>① <b>与公开基准逐位比对</b>：输出与 MIT 镜像的 π 十亿位文件（pi-billion.txt）的前 100,000,000 位<b>全部一致</b>（基准文件本身先核对了前 50 位与第 762–767 位的费曼点六连 9）。</p>
+<p>② <b>全程红线 + 分级自检梯子</b>：每次乘法查 0.25 红线（第 6 节；正式版本为设备侧累积、检查点判罚）；六级自检梯子逐级只暴露一类新风险——加减进位 ↔ Python 大整数对拍；schoolbook ↔ FFT 交叉；恒等式覆盖<b>全部</b> FFT 规格；牛顿窗口检查（含热启动重入）；小规模 π 逐位比对；最后才是一亿位（自检全绿：fft_err_max=0.0156 over 101 muls）。第 12–18 节的每一批改动都要先过它：</p>
+<pre class="code"><code># 节选自 pi-numba/pi_agm.py —— selftest S2：恒等式 (X+Y)² = X² + 2XY + Y² 覆盖全部 FFT 规格
+    # S2：恒等式 (X+Y)² = X² + 2XY + Y²，覆盖每一种 Q 与三级路径
+    for L in (4000, 8000, 16000, 32000, 65000, 130000, 260000, 520000, 1040000, 2080000,
+              4100000, 8300000, 16600000, 33000000, 41000000, 82000000):   # 三级区 R∈{2,4,8,16,32,64} 全档
+        X, Y = rand_big(L), rand_big(L)
+        S = C.big_add(X, Y)
+        lhs = F.mul_fft_path(S, S, True)
+        rhs = C.big_add(C.big_add(F.mul_fft_path(X, X, True), F.mul_fft_path(Y, Y, True)),
+                        C.big_scalar_mul(F.mul_fft_path(X, Y, False), 2))
+        N = F.fft_plan_n(2 * L + 1)
+        what = f"S2 identity (X+Y)^2, L={L}, N=2^{N.bit_length()-1}, Q={N//2048}"
+        if C.big_cmp(lhs, rhs) != 0: expect(False, what)
+        F.fft_error_checkpoint(what)
+        expect(True, what)
+        C.g_arena.restore(mark)</code></pre>
+<p>③ <b>middle product 对抗测试</b>（middlebench）：随机输入、全 999、超长进位链三类输入与完整乘法<b>逐 limb 对拍</b>。后两类正是第 16 节 guard 区间设计上无法坍缩的场景——日志里它们以 <code>reason=carry_interval</code> 回退到完整乘法，然后逐 limb 一致。「回退发生了」本身就是被验证的行为：若对抗输入悄悄走了快路径，才是真正的坏消息。</p>
+<p>④ <b>一亿位正式判定</b>：输出长度恰为 100,000,002 字节；MIT 文件逐字节比对完全一致；最大残差 0.00781 &lt; 0.25。</p>
+<div class="callout"><p>前 100 位与最后 10 位（第 99,999,991 – 100,000,000 位）：</p>
+<div class="digits">3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679…<br>……0187751592</div></div>
+
+<h2 id="c20">20. 结语</h2>
+<p>几件值得带走的事：</p>
+<p>• <b>算法先于实现</b>：二次收敛把一亿位压成 26 轮大运算——选对算法，问题的形状就先对了一半。<br>• <b>profile 不是仪式</b>：「真凶不是嫌疑人」一再上演（σ 散射、进位全量扫描、dispatcher 手续费），全靠 profiler 与秒表定罪。<br>• <b>省最多的字节，而不是最多的指令</b>：2-for-1、深度融合、稀疏进位——历次大幅加速全是带宽账。<br>• <b>最深的省法是「少算」</b>：middle product 一节几乎抵得上其余各档的总和——先问调用者要什么，再问怎么算快；而「少算」的执照由严格区间与自动回退签发（第 16 节），由对抗测试年检（本节 ④）。<br>• <b>库的 kernel 边界是你画的线</b>：把数学库请进 kernel，买到的不是更快的 FFT，而是对装载与写回相位的支配权。这条线先画进了搬运（第 15 节），又画进了频域中段（第 17 节）与进位链（第 18 节）——性能优化的每一步，都长在这份支配权上。</p>
+<p class="small">Gauss–Legendre/Brent–Salamin、FFT 大数乘法、牛顿倒数/开方、进位前瞻、middle product 均为高精度计算的经典方法。</p>
+
+</main></body></html>
